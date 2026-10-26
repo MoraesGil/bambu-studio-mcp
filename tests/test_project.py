@@ -321,7 +321,10 @@ def test_delete_preserves_other_root_ids_and_remaps_legacy_layer_metadata(source
     assert [e.get("id") for e in settings.findall("object")] == ["40"]
     assert [e.get("object_id") for e in settings.findall("assemble/assemble_item")] == ["40"]
     assert saved["3D/Objects/painted.model"] == payloads(source)["3D/Objects/painted.model"]
-    assert "object_id=40|" in saved[PROFILE].decode()
+    # Bambu bbs_3mf.cpp (926a719), importer 2990 and exporter 7840:
+    # the file identifies ModelObjects by their 1-based build ordinal.
+    assert "object_id=1|" in saved[PROFILE].decode()
+    assert project(output).get_layer_profile(40) == [0, 0.2, 1, 0.2, 4, 0.12]
 
 
 def test_unknown_object_mutations_raise(source):
@@ -331,15 +334,16 @@ def test_unknown_object_mutations_raise(source):
             action(999)
 
 
-def test_versioned_profiles_use_root_id_while_legacy_profiles_use_ordinal(source, tmp_path):
+def test_native_profiles_use_ordinals_while_public_lookup_uses_root_ids(source, tmp_path):
     p = project(source)
     assert p.get_layer_profile(20) == [0, 0.2, 1, 0.2, 2, 0.16]
     p.set_layer_profile(20, [0, 0.12, 1, 0.12, 2, 0.2])
     output = tmp_path / "profile.3mf"
     p.save(output)
     profile = payloads(output)[PROFILE].decode()
-    assert profile.startswith("layer_heights_profile_format_version=2\n")
-    assert "object_id=20|" in profile and "object_id=40|" in profile
+    # The official Bambu importer has no version-2/root-ID profile format.
+    assert not profile.startswith("layer_heights_profile_format_version=")
+    assert "object_id=1|" in profile and "object_id=2|" in profile
     reloaded = project(output)
     assert reloaded.get_layer_profile(20) == [0, 0.12, 1, 0.12, 2, 0.2]
     assert reloaded.get_layer_profile(40) == [0, 0.2, 1, 0.2, 4, 0.12]
