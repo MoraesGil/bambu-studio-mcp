@@ -1,0 +1,28 @@
+{
+  "repository": "bambulab/BambuStudio",
+  "commit": "926a7192574bcb9b3a732e1ec59a46d79cb45466",
+  "source_directory": "resources/profiles/BBL",
+  "license": "AGPL-3.0",
+  "files": [
+    {
+      "path": "filament/Generic PLA @BBL A1.json",
+      "sha256": "23c1aa2ebb152191ebc45b73ff997e0d91d8a2d4408f133e2dbb65560e014a6d",
+      "name": "Generic PLA @BBL A1"
+    },
+    {
+      "path": "filament/Generic PLA @base.json",
+      "sha256": "530b745e2062c4c577d7acce3601ac7586fc65de394726252354bec0ade3e4c5",
+      "name": "Generic PLA @base"
+    },
+    {
+      "path": "filament/fdm_filament_pla.json",
+      "sha256": "670d21ea6bdf1cd4b0a2bfddc743612ffd896cd6e5dbe767c25d2c4165c49a30",
+      "name": "fdm_filament_pla"
+    },
+    {
+      "path": "filament/fdm_filament_common.json",
+      "sha256": "8c7105b7d59a28f600c43a946f067b8b4d707b9711c0bf6b88e9166e48878548",
+      "name": "fdm_filament_common"
+    }
+  ]
+}

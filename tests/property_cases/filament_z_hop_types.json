@@ -1,0 +1,9 @@
+{
+  "key": "filament_z_hop_types",
+  "batch": 3,
+  "valid": [
+    {"value": ["Spiral Lift"], "normalized": ["Spiral Lift"], "xml": "Spiral Lift"},
+    {"value": ["nil"], "normalized": ["nil"], "xml": "nil"}
+  ],
+  "invalid": [["spiral"], [0], [true], "Spiral Lift"]
+}

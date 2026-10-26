@@ -1,0 +1,78 @@
+# Experimental: supply a native-runtime image validated by its operator.
+name: bambu-studio-mcp
+
+services:
+  mcp:
+    image: ${BAMBU_MCP_IMAGE:?Set your locally built Bambu runtime image}
+    init: true
+    restart: unless-stopped
+    user: "${BAMBU_MCP_UID:-1000}:${BAMBU_MCP_GID:-1000}"
+    cpus: 4.0
+    mem_limit: 8g
+    pids_limit: 512
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    ports:
+      - "127.0.0.1:${BAMBU_MCP_PORT:-8080}:8080"
+    command:
+      - --engine
+      - /opt/slicer-mcp/engine.json
+      - --artifacts
+      - /artifacts
+      - --presets
+      - /presets
+      - serve
+      - --transport
+      - streamable-http
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --no-update-check
+      - --auth-token-file
+      - /run/secrets/mcp-token
+      - --allowed-host
+      - 127.0.0.1:8080
+      - --allowed-host
+      - "127.0.0.1:${BAMBU_MCP_PORT:-8080}"
+      - --allowed-host
+      - "localhost:${BAMBU_MCP_PORT:-8080}"
+      - --allowed-origin
+      - "http://127.0.0.1:${BAMBU_MCP_PORT:-8080}"
+      - --allowed-origin
+      - "http://localhost:${BAMBU_MCP_PORT:-8080}"
+    volumes:
+      - type: bind
+        source: ${BAMBU_MCP_MODELS_DIR:?Set your read-only model directory}
+        target: /input
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${BAMBU_MCP_ARTIFACTS_DIR:?Set your persistent artifact directory}
+        target: /artifacts
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${BAMBU_MCP_PRESETS_DIR:?Set your read-only preset directory}
+        target: /presets
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${BAMBU_MCP_TOKEN_FILE:?Set your bearer token file}
+        target: /run/secrets/mcp-token
+        read_only: true
+        bind: {create_host_path: false}
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    healthcheck:
+      test: [CMD, /venv/bin/python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+networks:
+  default:
+    internal: true

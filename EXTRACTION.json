@@ -1,0 +1,22 @@
+{
+  "source_repository": "https://github.com/MoraesGil/snapmaker-orca-mcp",
+  "source_commit": "f100c44d11576558d1290f4c48330477bde238a8",
+  "source_directory": ".",
+  "source_license": "AGPL-3.0-only",
+  "previous_extraction": {
+    "source_repository": "https://github.com/MoraesGil/OrcaSlicer",
+    "source_commit": "ee087a5bd7ebbb5daf445211cea1a3a9e3c931ad",
+    "source_directory": "tools/slicer_mcp"
+  },
+  "native_repository": "https://github.com/bambulab/BambuStudio",
+  "native_source_ref": "v02.08.02.61",
+  "native_source_commit": "926a7192574bcb9b3a732e1ec59a46d79cb45466",
+  "native_update_ref": "master",
+  "upstream_helpers": {
+    "repository": "https://github.com/MaxEllis/orcaslicer-mcp",
+    "commit": "ccfacb43c2fd5a23973bfdabce89c74b2f6933fe",
+    "package_version": "0.1.17",
+    "license": "AGPL-3.0-only"
+  },
+  "notes": "Separate Bambu adaptation; no shared slicer-mcp-core extracted. Native binaries, networking plugin, private models/presets, G-code and local acceptance artifacts are excluded. Historical Snapmaker acceptance does not transfer. Preserve THIRD_PARTY.md attribution."
+}
