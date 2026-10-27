@@ -1,255 +1,290 @@
 # Portions derived from Max Ellis, orcaslicer-mcp@ccfacb43c2fd5a23973bfdabce89c74b2f6933fe.
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Preset use cases over injected catalog storage and engine identity ports."""
+"""Catalog queries and draft commands over injected repository capabilities."""
 from __future__ import annotations
+
 import copy
 import threading
+from collections import Counter
+
+from ...domain.settings.normalization import (
+    _IDS, _IDENTITY, _METADATA, _NATIVE_TYPES, _gcode, _placeholder, _redact,
+    _transport, _type, normalize_filament_profile, validate_changes,
+)
+from ...domain.settings.values import record, text
 from ...domain.types.json import JsonObject, JsonValue, json_object
-from ...domain.settings.normalization import (_type, _redact, _transport, _placeholder, _gcode,
-    _IDS, _METADATA, _NATIVE_TYPES, _IDENTITY, normalize_filament_profile, validate_changes)
-from ...domain.settings.values import text, record
-from ..contracts.presets import EngineIdentity, PresetRepository, PresetRecord
+from ..contracts.presets import EngineIdentity, PresetRecord, PresetRepository
+
+def _descriptor(preset: PresetRecord) -> JsonObject:
+    return {'name': preset['name'], 'type': preset['type'], 'source': preset['source'],
+            'path': preset['path'], 'sha256': preset['sha256'], 'read_only': preset['read_only']}
+
 
 class PresetService:
     def __init__(self, engine: EngineIdentity, repository: PresetRepository, schema: JsonObject):
         self.engine = engine
         self.repository = repository
         self.schema = schema
-        self.settings = {key: json_object(value) for key, value in schema.items() if not key.startswith('_')}
+        self.settings = {key: json_object(schema[key]) for key in schema if not key.startswith('_')}
         self._lock = threading.RLock()
 
     def _schema_status(self) -> JsonObject:
-        source_commit = record(self.schema["_meta"])["source_commit"]
-        engine_commit = self.engine.identity()["source_commit"]
-        return {"source_commit": source_commit, "engine_commit": engine_commit,
-                "matches_engine": source_commit == engine_commit,
-                "scope": "Source metadata and file inheritance; not runtime defaults or final region configuration"}
+        metadata = record(self.schema['_meta'])
+        native = self.engine.identity()['source_commit']
+        source = metadata['source_commit']
+        return {'source_commit': source, 'engine_commit': native, 'matches_engine': native == source,
+                'scope': 'Source metadata and file inheritance; not runtime defaults or final region configuration'}
 
     def _records(self) -> list[PresetRecord]:
         self.engine.verify()
-        result = self.repository.records()
+        snapshot = self.repository.records()
         self.engine.verify()
-        return result
+        return snapshot
 
     @staticmethod
     def _find(records: list[PresetRecord], kind: str, name: str) -> PresetRecord:
-        hits = [rec for rec in records if rec["type"] == kind and rec["name"] == name]
-        if len(hits) > 1:
-            raise ValueError(f"Ambiguous preset name {name}: " + ", ".join(rec["path"] for rec in hits))
-        if not hits:
-            raise ValueError(f"Unknown preset or missing inheritance parent: {kind}/{name}")
-        return hits[0]
+        matches = [item for item in records if (item['type'], item['name']) == (kind, name)]
+        if not matches:
+            raise ValueError(f'Unknown preset or missing inheritance parent: {kind}/{name}')
+        if len(matches) != 1:
+            locations = ', '.join(item['path'] for item in matches)
+            raise ValueError(f'Ambiguous preset name {name}: {locations}')
+        return matches[0]
 
-    def _resolve(self, records: list[PresetRecord], rec: PresetRecord, trail: tuple[tuple[str, str], ...] = ()) -> tuple[JsonObject, list[JsonObject], JsonObject]:
-        marker = (rec["type"], rec["name"])
-        if marker in trail:
-            raise ValueError(f"Preset inheritance cycle at {rec['name']}")
-        parent = rec["raw"].get("inherits", "")
-        if not isinstance(parent, str):
-            raise ValueError(f"Invalid inheritance parent for {rec['name']}")
-        config: JsonObject = {}
-        chain: list[JsonObject] = []
+    def _resolve(self, records: list[PresetRecord], rec: PresetRecord,
+                 trail: tuple[tuple[str, str], ...] = ()) -> tuple[JsonObject, list[JsonObject], JsonObject]:
+        """Traverse first, then fold root-to-leaf, without recursion depth limits."""
+        visited = set(trail)
+        lineage: list[PresetRecord] = []
+        node = rec
+        while True:
+            identity = node['type'], node['name']
+            if identity in visited:
+                raise ValueError(f"Preset inheritance cycle at {node['name']}")
+            visited.add(identity)
+            lineage.append(node)
+            parent = node['raw'].get('inherits', '')
+            if not isinstance(parent, str):
+                raise ValueError(f"Invalid inheritance parent for {node['name']}")
+            if parent == '':
+                break
+            node = self._find(records, node['type'], parent)
+        configuration: JsonObject = {}
         metadata: JsonObject = {}
-        if parent:
-            config, chain, metadata = self._resolve(records, self._find(records, rec["type"], parent), (*trail, marker))
-        config.update({key: copy.deepcopy(value) for key, value in rec["raw"].items() if key not in _METADATA})
-        if rec['type'] == 'filament' and 'filament_id' in rec['raw']:
-            identity = rec['raw']['filament_id']
-            if not isinstance(identity, str):
-                raise ValueError('Native filament_id metadata must be a string')
-            metadata['filament_id'] = identity
-        chain.append({key: rec[key] for key in ("name", "type", "source", "path", "sha256", "read_only")})
-        return config, chain, metadata
+        chain: list[JsonObject] = []
+        for ancestor in reversed(lineage):
+            for key, value in ancestor['raw'].items():
+                if key not in _METADATA:
+                    configuration[key] = copy.deepcopy(value)
+            if ancestor['type'] == 'filament' and 'filament_id' in ancestor['raw']:
+                native_id = ancestor['raw']['filament_id']
+                if not isinstance(native_id, str):
+                    raise ValueError('Native filament_id metadata must be a string')
+                metadata['filament_id'] = native_id
+            chain.append(_descriptor(ancestor))
+        return configuration, chain, metadata
 
     def _value(self, records: list[PresetRecord], rec: PresetRecord) -> JsonObject:
-        config, chain, metadata = self._resolve(records, rec)
-        id_key = _IDS[rec["type"]]
-        if id_key not in rec["raw"]:
-            config[id_key] = [rec["name"]] if rec["type"] == "filament" else rec["name"]
-        return record(_redact({**{key: rec[key] for key in ("name", "type", "source", "path", "sha256", "read_only")},
-                        "config": config, "raw_config": rec["raw"], "effective_metadata": metadata,
-                        "inherits": rec["raw"].get("inherits", ""),
-                        "inheritance": [item for item in chain], "engine": self.engine.identity(), "schema": self._schema_status(),
-                        "unknown_keys": [key for key in sorted(set(config) - set(self.settings))]}))
+        configuration, inheritance, metadata = self._resolve(records, rec)
+        key = _IDS[rec['type']]
+        if key not in rec['raw']:
+            configuration[key] = [rec['name']] if rec['type'] == 'filament' else rec['name']
+        payload = _descriptor(rec)
+        payload.update({'config': configuration, 'raw_config': copy.deepcopy(rec['raw']), 'effective_metadata': metadata,
+                        'inherits': rec['raw'].get('inherits', ''), 'inheritance': [item for item in inheritance],
+                        'engine': self.engine.identity(), 'schema': self._schema_status(),
+                        'unknown_keys': [key for key in sorted(configuration.keys() - self.settings.keys())]})
+        return record(_redact(payload))
 
     def list_presets(self, type: str | None = None, include_system: bool = False) -> JsonObject:
-        kind = _type(type) if type is not None else None
+        kind = None if type is None else _type(type)
         records = self._records()
-        result: list[JsonValue] = []
-        for rec in records:
-            if (kind is None or rec["type"] == kind) and (include_system or rec["source"] != "system"):
-                item: JsonObject = {key: rec[key] for key in ("name", "type", "source", "path", "sha256", "read_only")}
-                item["inherits"] = rec["raw"].get("inherits", "")
-                item["ambiguous"] = sum(other["name"] == rec["name"] and other["type"] == rec["type"] for other in records) > 1
-                result.append(item)
-        return {"presets": result, "engine": self.engine.identity(), "schema": self._schema_status()}
+        counts = Counter((item['type'], item['name']) for item in records)
+        presets: list[JsonValue] = []
+        for item in records:
+            if kind is not None and item['type'] != kind:
+                continue
+            if item['source'] == 'system' and not include_system:
+                continue
+            summary = _descriptor(item)
+            summary.update({'inherits': item['raw'].get('inherits', ''),
+                            'ambiguous': counts[(item['type'], item['name'])] > 1})
+            presets.append(summary)
+        return {'presets': presets, 'engine': self.engine.identity(), 'schema': self._schema_status()}
 
     def get_preset_config(self, type: str, name: str) -> JsonObject:
-        records = self._records()
-        return self._value(records, self._find(records, _type(type), name))
+        snapshot = self._records()
+        return self._value(snapshot, self._find(snapshot, _type(type), name))
+
+    def _group_keys(self, records: list[PresetRecord], kind: str) -> set[str]:
+        permitted = {_IDS[kind]}
+        for preset in records:
+            if preset['source'] == 'system' and preset['type'] == kind:
+                permitted |= (preset['raw'].keys() & self.settings.keys()) - _METADATA
+        return permitted
 
     def preset_keys(self, type: str) -> set[str]:
-        """Native Bambu group membership, including inherited resource fields."""
-        kind = _type(type)
-        records = self._records()
-        keys = {_IDS[kind]}
-        for rec in records:
-            if rec["source"] == "system" and rec["type"] == kind:
-                keys.update(key for key in rec["raw"] if key not in _METADATA and key in self.settings)
-        return keys
+        return self._group_keys(self._records(), _type(type))
 
     def describe_setting(self, key: str) -> JsonObject | None:
         self.engine.verify()
-        rec = self.settings.get(key)
-        return {"key": key, **copy.deepcopy(rec), "schema": self._schema_status()} if rec is not None else None
+        if key not in self.settings:
+            return None
+        return dict(copy.deepcopy(self.settings[key]), key=key, schema=self._schema_status())
 
     def search_settings(self, query: str, limit: int = 25) -> JsonObject:
         self.engine.verify()
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
-            raise ValueError("Setting search limit must be 1..100")
-        q = query.lower().strip()
-        hits = []
-        words = [word for word in q.replace("_", " ").split() if len(word) > 2]
-        for key, rec in self.settings.items():
-            fields = [key.lower(), text(rec.get("label") or "").lower(), text(rec.get("tooltip") or "").lower()]
-            rank = next((index for index, field in enumerate(fields) if q and q in field), 3)
-            score = sum(3 if word in fields[0] else 2 if word in fields[1] else 1 if word in fields[2] else 0 for word in words)
-            if q and (rank < 3 or score):
-                hits.append(((-1 if key.lower() == q else rank, -score, key),
-                             {"key": key, "label": rec.get("label"), "category": rec.get("category"),
-                              "tooltip": text(rec.get("tooltip") or "")[:160]}))
-        hits.sort(key=lambda item: item[0])
-        return {"settings": [item[1] for item in hits[:limit]], "schema": self._schema_status()}
+        if type(limit) is not int or limit not in range(1, 101):
+            raise ValueError('Setting search limit must be 1..100')
+        needle = query.strip().lower()
+        words = [word for word in needle.replace('_', ' ').split() if len(word) > 2]
+        ranked: list[tuple[tuple[int, int, str], JsonValue]] = []
+        for key, definition in self.settings.items():
+            fields = (key.lower(), text(definition.get('label') or '').lower(), text(definition.get('tooltip') or '').lower())
+            rank = next((index for index, value in enumerate(fields) if needle and needle in value), 3)
+            points = 0
+            for word in words:
+                points += next((3 - index for index, value in enumerate(fields) if word in value), 0)
+            if needle and (rank != 3 or points):
+                summary: JsonObject = {'key': key, 'label': definition.get('label'), 'category': definition.get('category'),
+                                       'tooltip': text(definition.get('tooltip') or '')[:160]}
+                ranked.append(((-1 if key.lower() == needle else rank, -points, key), summary))
+        ranked.sort(key=lambda pair: pair[0])
+        return {'settings': [value for _, value in ranked[:limit]], 'schema': self._schema_status()}
 
     @staticmethod
     def _name(name: str) -> str:
-        if not isinstance(name, str) or not name.strip() or len(name) > 256 or any(ord(ch) < 32 for ch in name):
-            raise ValueError("Preset name must be 1..256 printable characters")
-        return name
-
-    def _draft_path(self, kind: str, name: str) -> str:
-        return self.repository.draft_path(kind, name)
+        if isinstance(name, str) and 1 <= len(name) <= 256 and name.strip() and all(ord(char) >= 32 for char in name):
+            return name
+        raise ValueError('Preset name must be 1..256 printable characters')
 
     @staticmethod
     def _editable(rec: PresetRecord) -> None:
-        if rec["source"] != "draft" or rec["read_only"]:
-            raise ValueError("This preset is read-only; save_preset with another name in drafts")
+        if rec['read_only'] or rec['source'] != 'draft':
+            raise ValueError('This preset is read-only; save_preset with another name in drafts')
+
+    def _draft_path(self, kind: str, name: str) -> str:
+        return self.repository.draft_path(kind=kind, name=name)
 
     def _write(self, path: str, doc: JsonObject, previous: PresetRecord | None = None) -> None:
         self.engine.verify()
-        self.repository.write(path, doc, previous)
+        self.repository.write(location=path, doc=doc, previous=previous)
+
+    def _baseline(self, records: list[PresetRecord], kind: str, name: str, raw: JsonObject,
+                  parent: str, existing: PresetRecord | None) -> tuple[JsonObject, JsonObject]:
+        if parent == name:
+            raise ValueError('Preset inheritance cycle')
+        if existing is not None:
+            candidate = existing.copy()
+            candidate['raw'] = {**raw, 'inherits': parent}
+            baseline, _, metadata = self._resolve(records, candidate)
+            return baseline, metadata
+        if parent:
+            baseline, chain, metadata = self._resolve(records, self._find(records, kind, parent))
+            if any(ancestor['name'] == name for ancestor in chain):
+                raise ValueError('Preset inheritance cycle')
+            return baseline, metadata
+        return {}, {}
+
+    @staticmethod
+    def _detached(configuration: JsonObject, metadata: JsonObject, keys: set[str], allow_gcode: bool) -> JsonObject:
+        result = {key: copy.deepcopy(value) for key, value in configuration.items() if key in keys}
+        result.update(metadata)
+        for key, value in result.items():
+            empty = value in ([], [''], '')
+            if key == 'post_process' and not empty:
+                raise ValueError('post_process: prohibited preset write')
+            if _transport(key) and key not in _IDENTITY and not empty and value is not None:
+                raise ValueError(f'{key}: transport cannot be copied into a detached draft')
+            if _gcode(key) and not empty and not allow_gcode:
+                raise ValueError(f'{key}: detaching G-code requires allow_custom_gcode=True')
+        return result
 
     def save_preset(self, type: str, name: str, config: JsonObject, detach: bool = False,
                     allow_custom_gcode: bool = False) -> JsonObject:
         with self._lock:
-            kind, name = _type(type), self._name(name)
+            kind = _type(type)
+            name = self._name(name)
             if not isinstance(config, dict):
-                raise ValueError("Preset configuration must be an object")
+                raise ValueError('Preset configuration must be an object')
             records = self._records()
-            hits = [rec for rec in records if rec["type"] == kind and rec["name"] == name]
-            existing = self._find(records, kind, name) if hits else None
-            if existing:
+            existing = self._find(records, kind, name) if any((item['type'], item['name']) == (kind, name) for item in records) else None
+            if existing is not None:
                 self._editable(existing)
-            raw = copy.deepcopy(existing["raw"]) if existing else {}
-            parent = config.get("inherits", raw.get("inherits", ""))
+            raw = {} if existing is None else copy.deepcopy(existing['raw'])
+            parent = config.get('inherits', raw.get('inherits', ''))
             if not isinstance(parent, str):
-                raise ValueError("Preset inherits must name one parent")
-            baseline, _, baseline_metadata = self._resolve(records, existing) if existing else ({}, [], {})
-            parent_config: JsonObject = {}
-            if parent:
-                if parent == name:
-                    raise ValueError("Preset inheritance cycle")
-                parent_rec = self._find(records, kind, parent)
-                parent_config, chain, parent_metadata = self._resolve(records, parent_rec)
-                if any(item["name"] == name for item in chain):
-                    raise ValueError("Preset inheritance cycle")
-                if not existing:
-                    baseline = parent_config
-                    baseline_metadata = parent_metadata
-                elif parent != raw.get("inherits", ""):
-                    baseline = parent_config | {key: value for key, value in raw.items() if key not in _METADATA}
-                    baseline_metadata = parent_metadata | {key: value for key, value in raw.items() if key == 'filament_id'}
-            allowed = self.preset_keys(kind)
+                raise ValueError('Preset inherits must name one parent')
+            baseline, metadata = self._baseline(records, kind, name, raw, parent, existing)
             if kind == 'filament':
                 baseline = normalize_filament_profile(baseline, self.schema)
-            supplied = {key: value for key, value in config.items() if key not in _METADATA}
-            # Refuse protected writes before filtering other preset groups.
+            supplied: JsonObject = {key: value for key, value in config.items() if key not in _METADATA}
             for key, value in supplied.items():
-                if (key == "post_process" or _transport(key)) and (key == "post_process" or value != baseline.get(key)):
-                    raise ValueError(f"{key}: prohibited preset write")
+                if key == 'post_process' or (_transport(key) and baseline.get(key) != value):
+                    raise ValueError(f'{key}: prohibited preset write')
                 if key not in self.settings:
-                    raise ValueError(f"Unknown native setting: {key}")
+                    raise ValueError(f'Unknown native setting: {key}')
                 if _placeholder(value):
-                    raise ValueError(f"{key}: a redacted placeholder cannot be written")
-            ignored = sorted(set(supplied) - allowed)
-            changes = {key: value for key, value in supplied.items() if key in allowed and value != baseline.get(key)}
-            normalized = validate_changes(changes, baseline, self.schema, allow_custom_gcode)
+                    raise ValueError(f'{key}: a redacted placeholder cannot be written')
+            allowed = self._group_keys(records, kind)
+            differences = {key: value for key, value in supplied.items() if key in allowed and value != baseline.get(key)}
+            normalized = validate_changes(differences, baseline, self.schema, allow_custom_gcode)
             if detach:
-                raw = {key: copy.deepcopy(value) for key, value in (baseline | normalized).items() if key in allowed}
-                raw.update(baseline_metadata)
-                for key, value in raw.items():
-                    if key == "post_process" and value not in ([], [""], ""):
-                        raise ValueError("post_process: prohibited preset write")
-                    if _transport(key) and key not in _IDENTITY and value not in ([], [""], "", None):
-                        raise ValueError(f"{key}: transport cannot be copied into a detached draft")
-                    if _gcode(key) and value not in ([], [""], "") and not allow_custom_gcode:
-                        raise ValueError(f"{key}: detaching G-code requires allow_custom_gcode=True")
-                parent = ""
+                raw = self._detached({**baseline, **normalized}, metadata, allowed, allow_custom_gcode)
+                parent = ''
             else:
                 raw.update(normalized)
-            # A named filament preset represents one material, not a project slot map.
-            supplied_id = supplied.get(_IDS[kind])
-            if kind == "filament" and isinstance(supplied_id, list) and len(supplied_id) != 1:
-                raise ValueError("A filament preset ID must have one slot; project slots are not resized")
-            raw.update({"name": name, "type": _NATIVE_TYPES[kind], "from": "User", "inherits": parent,
-                        "version": raw.get("version", text(record(self.schema["_meta"])["native_version"])), "instantiation": "true",
-                        _IDS[kind]: [name] if kind == "filament" else name})
-            path = existing["path"] if existing else self._draft_path(kind, name)
-            self._write(path, raw, existing)
-            result = self.get_preset_config(kind, name)
-            return {**result, "saved": True, "ignored_keys": [key for key in ignored]}
+            identifier = supplied.get(_IDS[kind])
+            if kind == 'filament' and isinstance(identifier, list) and len(identifier) != 1:
+                raise ValueError('A filament preset ID must have one slot; project slots are not resized')
+            raw.update({'name': name, 'type': _NATIVE_TYPES[kind], 'from': 'User', 'inherits': parent,
+                        'version': raw.get('version', text(record(self.schema['_meta'])['native_version'])),
+                        'instantiation': 'true', _IDS[kind]: [name] if kind == 'filament' else name})
+            destination = existing['path'] if existing is not None else self._draft_path(kind, name)
+            self._write(destination, raw, existing)
+            return dict(self.get_preset_config(kind, name), saved=True, ignored_keys=[key for key in sorted(supplied.keys() - allowed)])
 
     def edit_preset(self, type: str, name: str, changes: JsonObject, allow_custom_gcode: bool = False) -> JsonObject:
         with self._lock:
             kind = _type(type)
-            records = self._records()
-            rec = self._find(records, kind, name)
-            self._editable(rec)
+            snapshot = self._records()
+            self._editable(self._find(snapshot, kind, name))
             if not isinstance(changes, dict):
-                raise ValueError("Preset changes must be an object")
-            wrong = set(changes) - self.preset_keys(kind)
-            if wrong:
-                raise ValueError("Settings do not belong to this preset group/type: " + ", ".join(sorted(wrong)))
+                raise ValueError('Preset changes must be an object')
+            invalid = changes.keys() - self._group_keys(snapshot, kind)
+            if invalid:
+                raise ValueError('Settings do not belong to this preset group/type: ' + ', '.join(sorted(invalid)))
             return self.save_preset(kind, name, changes, allow_custom_gcode=allow_custom_gcode)
 
     @staticmethod
     def _unreferenced(records: list[PresetRecord], rec: PresetRecord) -> None:
-        children = [item["name"] for item in records if item["type"] == rec["type"] and item["raw"].get("inherits") == rec["name"]]
+        children = sorted(item['name'] for item in records if item['type'] == rec['type'] and item['raw'].get('inherits') == rec['name'])
         if children:
-            raise ValueError("Preset is referenced by inheritance dependents: " + ", ".join(children))
+            raise ValueError('Preset is referenced by inheritance dependents: ' + ', '.join(children))
 
     def rename_preset(self, type: str, name: str, new_name: str) -> JsonObject:
         with self._lock:
-            kind, new_name = _type(type), self._name(new_name)
-            records = self._records()
-            rec = self._find(records, kind, name)
-            self._editable(rec)
-            if any(item["type"] == kind and item["name"] == new_name for item in records):
-                raise ValueError("Preset name already exists; choose another name")
-            self._unreferenced(records, rec)
-            raw = copy.deepcopy(rec["raw"])
-            raw.update({"name": new_name, _IDS[kind]: [new_name] if kind == "filament" else new_name})
-            path = self._draft_path(kind, new_name)
-            self._write(path, raw)
-            self.repository.remove(rec, rollback_path=path, action='rename')
-            return {**self.get_preset_config(kind, new_name), "renamed_from": name}
+            kind = _type(type)
+            destination_name = self._name(new_name)
+            snapshot = self._records()
+            original = self._find(snapshot, kind, name)
+            self._editable(original)
+            if any((item['type'], item['name']) == (kind, destination_name) for item in snapshot):
+                raise ValueError('Preset name already exists; choose another name')
+            self._unreferenced(snapshot, original)
+            renamed = copy.deepcopy(original['raw'])
+            renamed['name'] = destination_name
+            renamed[_IDS[kind]] = [destination_name] if kind == 'filament' else destination_name
+            destination = self._draft_path(kind, destination_name)
+            self._write(destination, renamed)
+            self.repository.remove(original, rollback_path=destination, action='rename')
+            return dict(self.get_preset_config(kind, destination_name), renamed_from=name)
 
     def delete_preset(self, type: str, name: str) -> JsonObject:
         with self._lock:
-            records = self._records()
-            rec = self._find(records, _type(type), name)
-            self._editable(rec)
-            self._unreferenced(records, rec)
-            path = rec['path']
-            self.repository.remove(rec, action='delete')
-            return {"name": name, "type": rec["type"], "deleted": True, "sha256": rec["sha256"], "path": str(path)}
+            snapshot = self._records()
+            original = self._find(snapshot, _type(type), name)
+            self._editable(original)
+            self._unreferenced(snapshot, original)
+            self.repository.remove(original, action='delete')
+            return {'deleted': True, 'name': name, 'type': original['type'], 'sha256': original['sha256'], 'path': original['path']}

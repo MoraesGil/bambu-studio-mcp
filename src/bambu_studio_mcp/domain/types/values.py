@@ -1,9 +1,20 @@
-"""Immutable values shared by document and native geometry operations."""
+"""Immutable domain values with explicit constructor invariants."""
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass
+
+
+def _finite_numbers(*values: object) -> bool:
+    for value in values:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return False
+        try:
+            if not math.isfinite(value):
+                return False
+        except OverflowError:
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -11,7 +22,7 @@ class ObjectId:
     value: int
 
     def __post_init__(self) -> None:
-        if type(self.value) is not int or self.value <= 0:
+        if not (type(self.value) is int and self.value >= 1):
             raise ValueError('Object IDs must be positive integers')
 
 
@@ -20,11 +31,12 @@ class Sha256:
     value: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.value, str) or not re.fullmatch('[0-9a-f]{64}', self.value):
+        valid = isinstance(self.value, str) and len(self.value) == 64
+        if not valid or set(self.value) - set('0123456789abcdef'):
             raise ValueError('SHA256 must contain 64 lowercase hexadecimal characters')
 
     def __str__(self) -> str:
-        return self.value
+        return str(self.value)
 
 
 @dataclass(frozen=True)
@@ -34,18 +46,18 @@ class XYZ:
     z: float
 
     def __post_init__(self) -> None:
-        if any(type(v) not in (int, float) or not math.isfinite(v) for v in (self.x, self.y, self.z)):
+        if not _finite_numbers(self.x, self.y, self.z):
             raise ValueError('Coordinates must contain three finite XYZ numbers')
 
     def as_list(self) -> list[float]:
-        return [float(self.x), float(self.y), float(self.z)]
+        return list(map(float, (self.x, self.y, self.z)))
 
 
 @dataclass(frozen=True)
 class BoxDimensions(XYZ):
     def __post_init__(self) -> None:
-        super().__post_init__()
-        if any(v <= 0 for v in (self.x, self.y, self.z)):
+        XYZ.__post_init__(self)
+        if min(self.x, self.y, self.z) <= 0:
             raise ValueError('dimensions must be strictly positive')
 
 
@@ -55,7 +67,7 @@ class LineRange:
     last: int
 
     def __post_init__(self) -> None:
-        if type(self.first) is not int or type(self.last) is not int or self.first < 1 or self.last < self.first:
+        if not (type(self.first) is type(self.last) is int and 0 < self.first <= self.last):
             raise ValueError('Line ranges must be ordered positive integers')
 
 
@@ -66,5 +78,6 @@ class HeightBand:
     height: float
 
     def __post_init__(self) -> None:
-        if not all(math.isfinite(v) for v in (self.low, self.high, self.height)) or self.low < 0 or self.high <= self.low or self.height <= 0:
+        valid = _finite_numbers(self.low, self.high, self.height)
+        if not valid or not (0 <= self.low < self.high and self.height > 0):
             raise ValueError('A band needs 0 <= min_z < max_z and positive layer_height')

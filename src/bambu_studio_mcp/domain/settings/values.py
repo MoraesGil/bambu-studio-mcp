@@ -1,29 +1,34 @@
-"""Small validators for typed JSON records at configuration boundaries."""
+"""Typed accessors for configuration values."""
 from __future__ import annotations
-from ..types.json import JsonValue, JsonObject, json_object
+from ..types.json import JsonObject, JsonValue, json_object
 
 
 def text(value: JsonValue, label: str = 'value') -> str:
-    if not isinstance(value, str):
-        raise ValueError(f'{label} must be a string')
-    return value
+    match value:
+        case str():
+            return value
+    raise ValueError(f'{label} must be a string')
 
 
 def array(value: JsonValue, label: str = 'value') -> list[JsonValue]:
-    if not isinstance(value, list):
-        raise ValueError(f'{label} must be an array')
-    return value
+    match value:
+        case list():
+            return value
+    raise ValueError(f'{label} must be an array')
 
 
 def strings(value: JsonValue, label: str = 'value') -> list[str]:
-    return [text(item, label) for item in array(value, label)]
+    items = array(value, label)
+    if any(not isinstance(item, str) for item in items):
+        raise ValueError(f'{label} must be a string')
+    return [str(item) for item in items]
 
 
 def integer(value: JsonValue, label: str = 'value') -> int:
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise ValueError(f'{label} must be an integer')
-    return value
+    if type(value) is int:
+        return value
+    raise ValueError(f'{label} must be an integer')
 
 
 def record(value: JsonValue) -> JsonObject:
-    return json_object(value)
+    return json_object(value, 'JSON value')

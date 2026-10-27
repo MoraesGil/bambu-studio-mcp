@@ -1,9 +1,12 @@
-"""Filesystem snapshots, verified cache records and native output artifacts."""
+"""Immutable slice snapshots, manifest validation and verified artifact reuse."""
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
 import shutil
+import tempfile
 import uuid
 import zipfile
 from pathlib import Path
@@ -14,75 +17,93 @@ from ...application.contracts.artifacts import GcodeLines
 from ...application.contracts.slicing import SliceRequest, SliceWorkspace, SourceSnapshot
 from ...application.services.lines import bounded_lines
 from ...domain.entities.slicing import JobManifest, PlateRecord
-from ...domain.types.json import JsonObject, JsonValue, json_object, decode_json, decode_object
+from ...domain.types.json import JsonObject, JsonValue, decode_json, decode_object, json_object
 from ..bambu.engine import file_hash
 
 
 def write_json(path: Path, value: JsonObject) -> None:
-    staging = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
-    staging.write_text(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
-    staging.replace(path)
+    encoded = (json.dumps(json_object(value), ensure_ascii=False, indent=2, allow_nan=False) + '\n').encode('utf-8')
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + '.', suffix='.tmp', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _reject_post_process(value: JsonValue) -> None:
-    if isinstance(value, dict):
-        if value.get('post_process') not in (None, '', [], ['']):
-            raise ValueError('External post-processing is unsupported by the native slice contract')
-        for child in value.values():
-            _reject_post_process(child)
-    elif isinstance(value, list):
-        for child in value:
-            _reject_post_process(child)
+    pending = [value]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, list):
+            pending.extend(node)
+        elif isinstance(node, dict):
+            if node.get('post_process') not in (None, '', [], ['']):
+                raise ValueError('External post-processing is unsupported by the native slice contract')
+            pending.extend(node.values())
 
 
 def validate_project(path: Path) -> None:
-    if path.suffix.lower() != '.3mf':
+    if path.suffix.casefold() != '.3mf':
         raise ValueError('Input must be a 3MF project')
-    with zipfile.ZipFile(path) as archive:
-        if not any(n.startswith('3D/') and n.endswith('.model') for n in archive.namelist()):
+    with zipfile.ZipFile(path, 'r') as package:
+        names = package.namelist()
+        if not any(name.startswith('3D/') and name.endswith('.model') for name in names):
             raise ValueError('The archive has no 3MF model; G-code alone is not a source project')
-        for entry in archive.infolist():
-            if not entry.filename.endswith(('.config', '.json')):
+        for member in package.infolist():
+            if not member.filename.endswith(('.json', '.config')):
                 continue
-            data = archive.read(entry)
+            contents = package.read(member)
             try:
-                config = decode_json(data)
-            except (ValueError, UnicodeDecodeError):
+                decoded = decode_json(contents)
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 try:
-                    root = ElementTree.fromstring(data)
+                    xml = ElementTree.fromstring(contents)
                 except ElementTree.ParseError:
                     continue
-                if any(n.get('key') == 'post_process' and n.get('value', '').strip() for n in root.iter()):
-                    raise ValueError('External post-processing is unsupported by the native slice contract')
-                continue
-            _reject_post_process(config)
+                for element in xml.iter():
+                    if element.attrib.get('key') == 'post_process' and element.attrib.get('value', '').strip():
+                        raise ValueError('External post-processing is unsupported by the native slice contract')
+            else:
+                _reject_post_process(decoded)
 
 
 def gcode_properties(path: Path) -> JsonObject:
-    config: JsonObject = {}
-    active = False
-    with path.open(errors='replace') as stream:
-        for line in stream:
-            if 'CONFIG_BLOCK_START' in line:
-                active = True
-            elif 'CONFIG_BLOCK_END' in line:
-                active = False
-            elif active and line.startswith(';') and ' = ' in line:
-                key, value = line[1:].split(' = ', 1)
-                config[key.strip()] = value.strip()
-    return config
+    exported: JsonObject = {}
+    in_config = False
+    with path.open(errors='replace') as source:
+        for raw in source:
+            if 'CONFIG_BLOCK_START' in raw:
+                in_config = True
+                continue
+            if 'CONFIG_BLOCK_END' in raw:
+                in_config = False
+                continue
+            if in_config and raw.startswith(';'):
+                key, separator, value = raw[1:].partition(' = ')
+                if separator:
+                    exported[key.strip()] = value.strip()
+    return exported
 
 
 def _manifest(value: JsonObject) -> TypeGuard[JobManifest]:
-    text = ('status', 'job_id', 'cache_key', 'props_path', 'props_sha256', 'manifest_uri', 'props_uri', 'log_path')
-    if not all(isinstance(value.get(key), str) for key in text):
+    required_strings = {'status', 'job_id', 'cache_key', 'props_path', 'props_sha256', 'manifest_uri', 'props_uri', 'log_path'}
+    for key in required_strings:
+        if not isinstance(value.get(key), str):
+            return False
+    if value.get('status') != 'ready' or type(value.get('cached')) is not bool or type(value.get('requested_plate')) is not int:
         return False
-    if type(value.get('cached')) is not bool or type(value.get('requested_plate')) is not int:
-        return False
-    if not all(isinstance(value.get(key), (int, float)) for key in ('native_elapsed_seconds', 'request_elapsed_seconds')):
-        return False
-    source, plates, flags = value.get('source'), value.get('plates'), value.get('compatibility_flags')
-    if not isinstance(source, dict) or not all(isinstance(source.get(key), str) for key in ('path', 'sha256')):
+    for key in ('native_elapsed_seconds', 'request_elapsed_seconds'):
+        duration = value.get(key)
+        if type(duration) not in (int, float) or not isinstance(duration, (int, float)) or not math.isfinite(duration):
+            return False
+    source, flags, plates = value.get('source'), value.get('compatibility_flags'), value.get('plates')
+    if not isinstance(source, dict) or any(not isinstance(source.get(key), str) for key in ('path', 'sha256')):
         return False
     if not isinstance(flags, dict) or type(flags.get('allow_newer_file')) is not bool:
         return False
@@ -90,13 +111,15 @@ def _manifest(value: JsonObject) -> TypeGuard[JobManifest]:
         return False
     if not isinstance(plates, list) or not plates:
         return False
+    seen: set[int] = set()
     for plate in plates:
         if not isinstance(plate, dict):
             return False
-        number = plate.get('plate')
-        if type(number) is not int or number <= 0 or type(plate.get('size_bytes')) is not int:
+        number, size = plate.get('plate'), plate.get('size_bytes')
+        if type(number) is not int or number <= 0 or number in seen or type(size) is not int or size <= 0:
             return False
-        if not all(isinstance(plate.get(key), str) for key in ('gcode_path', 'sha256', 'gcode_lines_uri')):
+        seen.add(number)
+        if any(not isinstance(plate.get(key), str) for key in ('gcode_path', 'sha256', 'gcode_lines_uri')):
             return False
     return True
 
@@ -104,127 +127,154 @@ def _manifest(value: JsonObject) -> TypeGuard[JobManifest]:
 class FilesystemArtifacts:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
-        (self.root / 'runs').mkdir(parents=True, exist_ok=True)
-        (self.root / 'cache').mkdir(exist_ok=True)
+        for name in ('runs', 'cache'):
+            (self.root / name).mkdir(parents=True, exist_ok=True)
+
+    def _directory(self, job_id: str) -> Path:
+        if not isinstance(job_id, str) or re.fullmatch('[0-9a-f]{32}', job_id) is None:
+            raise ValueError('Invalid generated job ID')
+        directory = self.root / 'runs' / job_id
+        if directory.resolve() != directory:
+            raise ValueError('Generated job directory cannot be a symlink')
+        return directory
 
     def prepare_source(self, input_3mf: str) -> SourceSnapshot:
-        source = Path(input_3mf).expanduser().resolve(strict=True)
-        validate_project(source)
-        return SourceSnapshot(str(source), file_hash(source))
+        path = Path(input_3mf).expanduser().resolve(strict=True)
+        validate_project(path)
+        digest = file_hash(path)
+        return SourceSnapshot(path=str(path), sha256=digest)
 
     def job(self, job_id: str) -> JobManifest:
-        if not re.fullmatch(r'[0-9a-f]{32}', job_id):
-            raise ValueError('Invalid generated job ID')
-        path = self.root / 'runs' / job_id / 'result.json'
-        if not path.is_file():
+        directory = self._directory(job_id)
+        manifest = directory / 'result.json'
+        if not manifest.is_file() or manifest.is_symlink():
             raise ValueError('Generated job is unavailable')
-        result = decode_object(path.read_text(), 'Generated job record')
-        if result.get('job_id') != job_id:
-            raise ValueError('Generated job record is invalid')
-        if not _manifest(result):
+        parsed = decode_object(manifest.read_bytes(), 'Generated job record')
+        if parsed.get('job_id') != job_id or not _manifest(parsed):
             raise ValueError('Generated job artifact records are invalid')
-        # Recorded absolute paths cannot redirect reads, including after a move.
-        job = path.parent
-        result['source'] = {**result['source'], 'path': str(job / 'source.3mf')}
-        result['plates'] = [{**p, 'gcode_path': str(job / f"plate_{p['plate']}.gcode")} for p in result['plates']]
-        result['props_path'], result['log_path'] = str(job / 'props.json'), str(job / 'engine.log')
-        return result
+        parsed['source']['path'] = str(directory / 'source.3mf')
+        for plate in parsed['plates']:
+            plate['gcode_path'] = str(directory / f"plate_{plate['plate']}.gcode")
+        parsed['props_path'] = str(directory / 'props.json')
+        parsed['log_path'] = str(directory / 'engine.log')
+        return parsed
 
     def intact(self, result: JobManifest) -> bool:
-        if not re.fullmatch(r'[0-9a-f]{32}', result['job_id']) or not result['plates']:
-            return False
-        job = self.root / 'runs' / result['job_id']
-        records = [(job / 'source.3mf', result['source']['sha256']), (job / 'props.json', result['props_sha256'])]
-        records.extend((job / f"plate_{p['plate']}.gcode", p['sha256']) for p in result['plates'])
-        return all(path.is_file() and file_hash(path) == expected for path, expected in records)
-
-    def cached(self, key: str, request: SliceRequest, source: SourceSnapshot,
-               engine: JsonObject) -> JsonObject | None:
-        cache = self.root / 'cache' / f'{key}.json'
-        if not cache.is_file():
-            return None
         try:
-            pointer = decode_object(cache.read_text())
-            job_id = pointer['job_id']
+            directory = self._directory(result['job_id'])
+            expected = {'source.3mf': result['source']['sha256'], 'props.json': result['props_sha256']}
+            for plate in result['plates']:
+                expected[f"plate_{plate['plate']}.gcode"] = plate['sha256']
+            if not result['plates']:
+                return False
+            for filename, digest in expected.items():
+                path = directory / filename
+                if path.is_symlink() or not path.is_file() or file_hash(path) != digest:
+                    return False
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def cached(self, key: str, request: SliceRequest, source: SourceSnapshot, engine: JsonObject) -> JsonObject | None:
+        pointer = self.root / 'cache' / f'{key}.json'
+        try:
+            entry = decode_object(pointer.read_bytes())
+            job_id = entry.get('job_id')
             if not isinstance(job_id, str):
                 return None
+            manifest = self._directory(job_id) / 'result.json'
+            if entry.get('result_sha256') != file_hash(manifest):
+                return None
             result = self.job(job_id)
-            record = self.root / 'runs' / result['job_id'] / 'result.json'
-            matches = (pointer.get('result_sha256') == file_hash(record)
-                and result['cache_key'] == key and result['requested_plate'] == request.plate
-                and result['source']['sha256'] == source.sha256 and result['engine'] == engine
-                and result['compatibility_flags'] == {'allow_newer_file': request.allow_newer_file})
-            return json_object(result) if matches and self.intact(result) else None
-        except (OSError, ValueError, KeyError, TypeError):
+            if (result['cache_key'], result['requested_plate'], result['source']['sha256'], result['engine'], result['compatibility_flags']) != (
+                    key, request.plate, source.sha256, engine, {'allow_newer_file': request.allow_newer_file}):
+                return None
+            return json_object(result) if self.intact(result) else None
+        except (OSError, ValueError, TypeError, KeyError):
             return None
 
     def create(self, source: SourceSnapshot) -> SliceWorkspace:
-        job_id = uuid.uuid4().hex
-        job = self.root / 'runs' / job_id
-        job.mkdir()
-        snapshot = job / 'source.3mf'
-        shutil.copyfile(source.path, snapshot)
-        if file_hash(snapshot) != source.sha256:
-            raise ValueError('Source changed during snapshot; retry with a stable saved file')
-        validate_project(snapshot)
-        return SliceWorkspace(job_id, str(job), SourceSnapshot(str(snapshot), source.sha256))
+        identity = uuid.uuid4().hex
+        directory = self._directory(identity)
+        directory.mkdir()
+        target = directory / 'source.3mf'
+        try:
+            shutil.copyfile(source.path, target)
+            if source.sha256 != file_hash(target):
+                raise ValueError('Source changed during snapshot; retry with a stable saved file')
+            validate_project(target)
+        except BaseException:
+            shutil.rmtree(directory)
+            raise
+        return SliceWorkspace(identity, str(directory), SourceSnapshot(str(target), source.sha256))
 
     def publish(self, workspace: SliceWorkspace, key: str, request: SliceRequest,
                 engine: JsonObject, engine_status: JsonObject, native_seconds: float,
                 request_seconds: float) -> JsonObject:
-        job, job_id = Path(workspace.directory), workspace.job_id
-        files = sorted((p for p in job.glob('plate_*.gcode') if re.fullmatch(r'plate_\d+\.gcode', p.name)),
-                       key=lambda p: int(p.stem.split('_')[1]))
-        if not files or any(p.stat().st_size == 0 for p in files):
-            raise RuntimeError(f'Native slice returned no valid G-code; diagnostics: {job}')
-        numbers = [int(p.stem.split('_')[1]) for p in files]
-        if request.plate and numbers != [request.plate]:
-            raise RuntimeError(f'Native output plate mismatch; diagnostics: {job}')
-        native_config = decode_json((job / 'native-settings.json').read_text())
-        props: JsonObject = {
+        directory = self._directory(workspace.job_id)
+        if directory != Path(workspace.directory) or Path(workspace.source.path) != directory / 'source.3mf':
+            raise ValueError('Slice workspace belongs to another repository')
+        if file_hash(directory / 'source.3mf') != workspace.source.sha256:
+            raise ValueError('Slice source snapshot changed during native execution')
+        outputs: dict[int, Path] = {}
+        for candidate in directory.glob('plate_*.gcode'):
+            match = re.fullmatch(r'plate_([1-9][0-9]*)\.gcode', candidate.name)
+            if match and candidate.is_file() and not candidate.is_symlink():
+                outputs[int(match[1])] = candidate
+        if not outputs or any(path.stat().st_size <= 0 for path in outputs.values()):
+            raise RuntimeError(f'Native slice returned no valid G-code; diagnostics: {directory}')
+        if request.plate and set(outputs) != {request.plate}:
+            raise RuntimeError(f'Native output plate mismatch; diagnostics: {directory}')
+        properties: JsonObject = {
             'scope': 'native_global_export_and_per_plate_config_block; final per-region values are not exhaustively exported',
-            'native_global': native_config,
-            'plate_config': {str(n): gcode_properties(p) for n, p in zip(numbers, files)},
+            'native_global': decode_json((directory / 'native-settings.json').read_bytes()),
+            'plate_config': {str(number): gcode_properties(outputs[number]) for number in sorted(outputs)},
             'fallback_profile': None,
             'substitution_coverage': 'Native defaults and compatibility substitutions may apply; consult settings and engine.log'}
-        write_json(job / 'props.json', props)
-        plates: list[PlateRecord] = [{'plate': n, 'gcode_path': str(p), 'sha256': file_hash(p),
-            'size_bytes': p.stat().st_size, 'gcode_lines_uri': f'slicer://jobs/{job_id}/plates/{n}/lines/1/200'}
-            for n, p in zip(numbers, files)]
+        props = directory / 'props.json'
+        write_json(props, properties)
+        plates: list[PlateRecord] = []
+        for number, path in sorted(outputs.items()):
+            plates.append(PlateRecord(plate=number, gcode_path=str(path), sha256=file_hash(path), size_bytes=path.stat().st_size,
+                gcode_lines_uri=f'slicer://jobs/{workspace.job_id}/plates/{number}/lines/1/200'))
         result: JobManifest = {
-            'status': 'ready', 'job_id': job_id, 'cached': False, 'cache_key': key, 'requested_plate': request.plate,
-            'compatibility_flags': {'allow_newer_file': request.allow_newer_file},
+            'status': 'ready', 'job_id': workspace.job_id, 'cached': False, 'cache_key': key,
+            'requested_plate': request.plate, 'compatibility_flags': {'allow_newer_file': request.allow_newer_file},
             'source': {'path': workspace.source.path, 'sha256': workspace.source.sha256},
             'engine': engine, 'engine_status': engine_status, 'plates': plates,
-            'props_path': str(job / 'props.json'), 'props_sha256': file_hash(job / 'props.json'),
-            'manifest_uri': f'slicer://jobs/{job_id}/manifest', 'props_uri': f'slicer://jobs/{job_id}/props',
-            'log_path': str(job / 'engine.log'), 'native_elapsed_seconds': native_seconds,
+            'props_path': str(props), 'props_sha256': file_hash(props),
+            'manifest_uri': f'slicer://jobs/{workspace.job_id}/manifest', 'props_uri': f'slicer://jobs/{workspace.job_id}/props',
+            'log_path': str(directory / 'engine.log'), 'native_elapsed_seconds': native_seconds,
             'request_elapsed_seconds': request_seconds}
-        payload = json_object(result)
-        write_json(job / 'result.json', payload)
-        write_json(self.root / 'cache' / f'{key}.json', {'job_id': job_id, 'result_sha256': file_hash(job / 'result.json')})
-        return payload
+        manifest = directory / 'result.json'
+        output = json_object(result)
+        write_json(manifest, output)
+        write_json(self.root / 'cache' / f'{key}.json', {'job_id': workspace.job_id, 'result_sha256': file_hash(manifest)})
+        return output
 
     def recover_3mf(self, gcode_file: str) -> JsonObject:
-        expected = file_hash(Path(gcode_file).expanduser().resolve(strict=True))
-        candidates: dict[str, JsonObject] = {}
-        for path in (self.root / 'runs').glob('*/result.json'):
+        wanted = file_hash(Path(gcode_file).expanduser().resolve(strict=True))
+        sources: dict[str, JsonObject] = {}
+        for record_path in (self.root / 'runs').glob('*/result.json'):
             try:
-                result = self.job(path.parent.name)
-                if any(p['sha256'] == expected for p in result['plates']) and self.intact(result):
-                    candidates[result['source']['sha256']] = json_object(result['source'])
-            except (OSError, ValueError, KeyError, TypeError):
+                manifest = self.job(record_path.parent.name)
+                matching = any(plate['sha256'] == wanted for plate in manifest['plates'])
+                if matching and self.intact(manifest):
+                    sources[manifest['source']['sha256']] = json_object(manifest['source'])
+            except (OSError, ValueError, TypeError, KeyError):
                 continue
-        if len(candidates) != 1:
+        if len(sources) != 1:
             raise ValueError('Original 3MF is unavailable or ambiguous; G-code cannot reconstruct its source mesh')
-        return {'kind': 'source_recovery', 'reconstructed': False, 'gcode_sha256': expected,
-                **next(iter(candidates.values()))}
+        source = next(iter(sources.values()))
+        return dict(source, kind='source_recovery', reconstructed=False, gcode_sha256=wanted)
 
     def read_lines(self, job_id: str, plate: int, start: int = 1, count: int = 200) -> GcodeLines:
-        # Validate the range even when the job/plate is unavailable.
         bounded_lines((), job_id, plate, start, count)
-        result = self.job(job_id)
-        if plate not in [p['plate'] for p in result['plates']]:
+        manifest = self.job(job_id)
+        if type(plate) is not int or not any(item['plate'] == plate for item in manifest['plates']):
             raise ValueError('Plate is not part of this generated job')
-        with (self.root / 'runs' / job_id / f'plate_{plate}.gcode').open(errors='replace') as stream:
-            return bounded_lines(stream, job_id, plate, start, count)
+        if not self.intact(manifest):
+            raise ValueError('Generated job artifacts changed outside the service')
+        target = self._directory(job_id) / f'plate_{plate}.gcode'
+        with target.open(errors='replace') as source:
+            return bounded_lines(source, job_id, plate, start, count)
