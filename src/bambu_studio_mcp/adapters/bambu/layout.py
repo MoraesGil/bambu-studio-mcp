@@ -1,42 +1,42 @@
-"""Recover verified world transforms from official CPU-only native operations.
+"""Bambu CLI layout measurements and source-pinned variable layer generation.
 
-STLs are measurements in an isolated scratch directory, never replacement 3MF
-assets. The caller applies the returned deltas to its preserved project graph.
+Layout uses Bambu's CPU STL export, never a renderer or a replacement project.
+Every measured vertex must fit one rigid transform of the preserved 3MF graph.
+Adaptive generation follows BambuStudio 926a719 Slicing.cpp/SlicingAdaptive.cpp;
+explicit height-range overlays preserve this wrapper's editing contract.
 """
 from __future__ import annotations
 
 import itertools
 import json
 import math
-import os
 import re
-import signal
 import struct
-import subprocess
 import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Sequence, Mapping
-from typing import TypedDict, NotRequired
+from typing import NotRequired, TypedDict
 from xml.etree import ElementTree as ET
 
-from ...engine import Engine as Engine, file_hash as file_hash
-from ..three_mf.xml import native_xml, XML_LOCK
-from ...domain.types.json import JsonValue, JsonObject, json_object
-from ...domain.types.values import Sha256
 from ...domain.entities.project import NativeLayout
-from .project_format import ensure_bambu_project
-
+from ...domain.types.json import JsonObject, JsonValue, json_object
+from ...engine import Engine as Engine, file_hash as file_hash
 from ..three_mf.geometry import (
     Geometry as _Geometry, matrix as _matrix, point as _point,
     compose as _compose, read_metadata as _metadata,
     Point as Point, Triangle as Triangle, InstanceKey as InstanceKey,
 )
+from ..three_mf.xml import XML_LOCK, native_xml
+from .project_format import ensure_bambu_project
+from .runner import run_command
 
-__all__ = [
-    "_Geometry", "_matrix", "_point", "_compose", "_metadata",
-    "Engine", "file_hash", "native_deltas", "adaptive_layer_profile",
-]
+__all__ = ['_Geometry', '_matrix', '_point', '_compose', '_metadata',
+           'Engine', 'file_hash', 'native_deltas', 'adaptive_layer_profile']
 _XML_LOCK = XML_LOCK
+_CORE = 'http://schemas.microsoft.com/3dmanufacturing/core/2015/02'
+_PRODUCTION = 'http://schemas.microsoft.com/3dmanufacturing/production/2015/06'
+BAMBU_ADAPTIVE_SOURCE = '926a7192574bcb9b3a732e1ec59a46d79cb45466'
 
 
 class LayoutState(TypedDict):
@@ -44,10 +44,12 @@ class LayoutState(TypedDict):
     native_plate_count: int
     bed_dimensions_mm: list[float]
 
+
 class PlateFrame(LayoutState):
     source_origin: list[float]
     native_origin: list[float]
     world_correction: list[float]
+
 
 class RunRecord(TypedDict):
     argv: list[str]
@@ -57,9 +59,11 @@ class RunRecord(TypedDict):
     elapsed_seconds: NotRequired[float]
     log_sha256: NotRequired[str]
 
+
 class ArtifactRecord(TypedDict):
     path: str
     sha256: str
+
 
 class VerifiedInstance(TypedDict):
     object_id: int
@@ -69,12 +73,14 @@ class VerifiedInstance(TypedDict):
     max_error_mm: float
     tolerance_mm: float
 
+
 class LockedInstance(TypedDict):
     object_id: int
     instance_id: int
     plate: int
     vertices_verified: int
     relative_pose_error_mm: float
+
 
 class AuditRecord(TypedDict):
     status: str
@@ -96,496 +102,485 @@ class AuditRecord(TypedDict):
     error: NotRequired[str]
 
 
-
-_CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
-_PRODUCTION = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06"
-_NS = {"c": _CORE}
-_IDENTITY = [1., 0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0.]
-
-
 def _native_xml(tree: ET.Element) -> bytes:
-    return native_xml(tree, _CORE, _PRODUCTION)
+    serialized = native_xml(tree, _CORE, _PRODUCTION)
+    return serialized
 
 
 def _read_stl(path: Path) -> list[Point]:
     if path.is_symlink():
-        raise ValueError("Native STL output cannot be a symlink")
-    data = path.read_bytes()
-    if len(data) < 84:
-        raise ValueError("Native output is not a binary STL")
-    count = struct.unpack_from("<I", data, 80)[0]
-    if not count or len(data) != 84 + count * 50:
-        raise ValueError("Native STL facet count is invalid")
-    points = [tuple(face[i:i + 3]) for face in struct.iter_unpack("<12fH", data[84:]) for i in (3, 6, 9)]
-    if not all(all(math.isfinite(n) for n in point) for point in points):
-        raise ValueError("Native STL has non-finite coordinates")
+        raise ValueError('Native STL output cannot be a symlink')
+    payload = path.read_bytes()
+    if len(payload) < 84:
+        raise ValueError('Native output is not a binary STL')
+    facets, = struct.unpack_from('<I', payload, 80)
+    if facets == 0 or len(payload) != facets * 50 + 84:
+        raise ValueError('Native STL facet count is invalid')
+    points: list[Point] = []
+    for index in range(facets):
+        coordinates = struct.unpack_from('<9f', payload, 84 + index * 50 + 12)
+        points.extend(tuple(coordinates[start:start + 3]) for start in (0, 3, 6))
+    if any(not math.isfinite(coordinate) for vertex in points for coordinate in vertex):
+        raise ValueError('Native STL has non-finite coordinates')
     return points
 
 
 def _subtract(a: Sequence[float], b: Sequence[float]) -> Point:
-    return tuple(x - y for x, y in zip(a, b))
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
 
 
 def _dot(a: Sequence[float], b: Sequence[float]) -> float:
-    return sum(x * y for x, y in zip(a, b))
+    return math.fsum(a[index] * b[index] for index in range(3))
 
 
 def _cross(a: Sequence[float], b: Sequence[float]) -> Point:
-    return a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]
+    return (a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
 
 
 def _tolerance(*meshes: Sequence[Sequence[float]]) -> float:
-    # Binary STL is float32. Allow its rounding at the measured coordinate
-    # magnitude while retaining a 0.2 micron absolute floor in print space.
-    magnitude = max((abs(n) for mesh in meshes for p in mesh for n in p), default=1.)
-    return max(0.0002, magnitude * 4 * 2 ** -23)
+    # Bambu export_models(IO::STL) writes float32 coordinates. Use four ulps
+    # at the largest world coordinate, with a 0.2 micron absolute floor.
+    largest = max((abs(value) for mesh in meshes for vertex in mesh for value in vertex), default=1.)
+    return max(2e-4, math.ldexp(largest, -21))
 
 
 def _verify_baseline(points: list[Point], triangles: list[Triangle], instance: list[float]) -> None:
-    if len(points) != 3 * len(triangles):
-        raise ValueError("Native baseline changed the source facet count")
+    if len(points) != len(triangles) * 3:
+        raise ValueError('Native baseline changed the source facet count')
     tolerance = _tolerance(points)
-    for index, triangle in enumerate(triangles):
-        expected = [_point(p, instance) for p in triangle]
-        actual = points[index * 3:index * 3 + 3]
-        # Native import may reverse a negative-volume or mirrored facet. Its
-        # three positions must still be this exact source triangle in space.
-        if not any(all(math.dist(a, b) <= tolerance for a, b in zip(actual, order))
-                   for order in itertools.permutations(expected)):
-            raise ValueError("Native baseline changed the source pose or facet sequence; no delta can be certified")
+    for ordinal, source in enumerate(triangles):
+        world = tuple(_point(vertex, instance) for vertex in source)
+        measured = points[ordinal * 3:ordinal * 3 + 3]
+        matched = any(max(math.dist(left, right) for left, right in zip(measured, candidate)) <= tolerance
+                      for candidate in itertools.permutations(world))
+        if not matched:
+            raise ValueError('Native baseline changed the source pose or facet sequence; no delta can be certified')
+
+
+def _unit(vector: Point) -> Point:
+    length = math.sqrt(_dot(vector, vector))
+    if length <= 0:
+        raise ValueError('A non-coplanar source basis is required to certify a 3D delta')
+    return tuple(value / length for value in vector)
 
 
 def _recover(before: list[Point], after: list[Point]) -> tuple[list[float], float, float]:
+    """Construct orthonormal source/target frames, then certify all vertices.
+
+    A three-axis frame avoids solving an unconstrained affine fit. Scale, shear,
+    reflection and reordered facets fail vertex certification; no least-squares
+    approximation can hide a geometry change.
+    """
     if len(before) != len(after) or len(before) < 4:
-        raise ValueError("Native operations changed facet correspondence")
-    p0 = before[0]
-    i1 = max(range(len(before)), key=lambda i: math.dist(p0, before[i]))
-    v1 = _subtract(before[i1], p0)
-    i2 = max(range(len(before)), key=lambda i: _dot(_cross(v1, _subtract(before[i], p0)),
-                                                  _cross(v1, _subtract(before[i], p0))))
-    v2 = _subtract(before[i2], p0)
-    normal = _cross(v1, v2)
-    i3 = max(range(len(before)), key=lambda i: abs(_dot(normal, _subtract(before[i], p0))))
-    v3 = _subtract(before[i3], p0)
-    determinant = _dot(v1, _cross(v2, v3))
-    extent = max(math.dist(p0, p) for p in before)
-    if extent == 0 or abs(determinant) <= extent ** 3 * 1e-10:
-        raise ValueError("A non-coplanar source basis is required to certify a 3D delta")
-    # Inverse of the matrix whose rows are the three source basis vectors.
-    columns = [_cross(v2, v3), _cross(v3, v1), _cross(v1, v2)]
-    inverse = [[columns[j][i] / determinant for j in range(3)] for i in range(3)]
-    targets = [_subtract(after[i], after[0]) for i in (i1, i2, i3)]
-    linear = [sum(inverse[i][k] * targets[k][j] for k in range(3)) for i in range(3) for j in range(3)]
-    translation = [after[0][j] - sum(p0[k] * linear[3 * k + j] for k in range(3)) for j in range(3)]
-    matrix = linear + translation
-    rows = [linear[i:i + 3] for i in (0, 3, 6)]
-    if (abs(_dot(rows[0], _cross(rows[1], rows[2])) - 1.) > 2e-5
-            or any(abs(_dot(rows[i], rows[j]) - (1. if i == j else 0.)) > 2e-5
-                   for i in range(3) for j in range(3))):
-        raise ValueError("Native operation introduced scale, shear or reflection; a rigid delta is required")
-    maximum_error = max(math.dist(_point(p, matrix), q) for p, q in zip(before, after))
+        raise ValueError('Native operations changed facet correspondence')
+    origin = before[0]
+    first = max(range(len(before)), key=lambda n: math.dist(origin, before[n]))
+    axis = _subtract(before[first], origin)
+    second = max(range(len(before)), key=lambda n: _dot(_cross(axis, _subtract(before[n], origin)),
+                                                         _cross(axis, _subtract(before[n], origin))))
+    perpendicular = _cross(axis, _subtract(before[second], origin))
+    extent = math.dist(origin, before[first])
+    if extent == 0 or max(abs(_dot(perpendicular, _subtract(vertex, origin))) for vertex in before) <= extent ** 3 * 1e-10:
+        raise ValueError('A non-coplanar source basis is required to certify a 3D delta')
+
+    def frame(vertices: list[Point]) -> tuple[Point, Point, Point]:
+        x = _unit(_subtract(vertices[first], vertices[0]))
+        z = _unit(_cross(x, _subtract(vertices[second], vertices[0])))
+        return x, _cross(z, x), z
+
+    left, right = frame(before), frame(after)
+    rotation = [math.fsum(left[axis][i] * right[axis][j] for axis in range(3))
+                for i in range(3) for j in range(3)]
+    translation = [after[0][j] - math.fsum(origin[i] * rotation[3 * i + j] for i in range(3)) for j in range(3)]
+    transform = rotation + translation
     tolerance = _tolerance(before, after)
-    if maximum_error > tolerance:
-        raise ValueError("Native facet correspondence changed or cannot be verified for every vertex")
-    return matrix, maximum_error, tolerance
+    error = max(math.dist(_point(vertex, transform), observed) for vertex, observed in zip(before, after))
+    if error > tolerance:
+        raise ValueError('Native operation is non-rigid or changed vertex correspondence')
+    return transform, error, tolerance
 
 
 def _write_audit(work: Path, value: AuditRecord) -> None:
-    (work / "native_ops.json").write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+    content = json.dumps(value, indent=2, ensure_ascii=False)
+    (work / 'native_ops.json').write_text(content + '\n', encoding='utf-8')
 
 
 def _layout_state(geometry: _Geometry, log_path: Path) -> LayoutState:
-    """Read the actual native bed and post-arrange plate count."""
-    plates = geometry.settings.findall("plate")
-    identifiers = [int(_metadata(p).get("plater_id", i)) for i, p in enumerate(plates, 1)]
-    if identifiers != list(range(1, len(plates) + 1)):
-        raise ValueError("Native plate frame requires sequential, ordered plate ids")
-    log = log_path.read_text(errors="replace")
-    before = log.split("before arrange, need_arrange=", 1)[0]
-    shapes = re.findall(r"m_plate_width (\d+), m_plate_depth (\d+), m_plate_height \d+, plate count (\d+)", before)
-    counts = re.findall(r"rebuild_plates_after_arrangement:after rebuild, plates count (\d+)", log)
-    if not shapes or not counts:
-        raise ValueError("Native plate frame could not be observed from its layout diagnostics")
-    width, depth, original_count = map(int, shapes[-1])
-    final_count = int(counts[-1])
-    if original_count != (len(plates) or 1) or not 1 <= final_count <= 36 or min(width, depth) <= 0:
-        raise ValueError("Native layout changed the plate grid unexpectedly")
-    return {"source_plate_count": original_count, "native_plate_count": final_count,
-            "bed_dimensions_mm": [width, depth]}
+    plates = geometry.settings.findall('plate')
+    ids = [int(_metadata(node).get('plater_id', str(index))) for index, node in enumerate(plates, 1)]
+    if ids != list(range(1, len(ids) + 1)):
+        raise ValueError('Native plate frame requires sequential, ordered plate ids')
+    initial: tuple[int, int, int] | None = None
+    final: int | None = None
+    arranging = False
+    for line in log_path.read_text(errors='replace').splitlines():
+        arranging = arranging or 'before arrange, need_arrange=' in line
+        shape = re.search(r'm_plate_width (\d+), m_plate_depth (\d+), m_plate_height \d+, plate count (\d+)', line)
+        count = re.search(r'rebuild_plates_after_arrangement:after rebuild, plates count (\d+)', line)
+        if shape and not arranging:
+            initial = int(shape[1]), int(shape[2]), int(shape[3])
+        if count:
+            final = int(count[1])
+    if initial is None or final is None:
+        raise ValueError('Native plate frame could not be observed from its layout diagnostics')
+    width, depth, source_count = initial
+    if min(width, depth) <= 0 or source_count != (len(plates) or 1) or not 1 <= final <= 36:
+        raise ValueError('Native layout changed the plate grid unexpectedly')
+    return dict(source_plate_count=source_count, native_plate_count=final, bed_dimensions_mm=[float(width), float(depth)])
 
 
 def _plate_origin(index: int, count: int, dimensions: Sequence[float]) -> list[float]:
-    # Exact PartPlate.cpp compute_shape_position, using native measured bed
-    # dimensions and observed counts rather than assuming a 324 mm stride.
-    columns = math.ceil(math.sqrt(count))
-    return [(index % columns) * dimensions[0] * 1.2, -(index // columns) * dimensions[1] * 1.2, 0.]
+    # PartPlate.cpp::compute_shape_position uses a sqrt grid and logical gap .2.
+    row, column = divmod(index, math.ceil(math.sqrt(count)))
+    return [column * (dimensions[0] + dimensions[0] / 5), -row * (dimensions[1] + dimensions[1] / 5), 0.]
 
 
 def _plate_frame(state: LayoutState, plate: int) -> PlateFrame:
-    """Restore a selected plate's frame after native empty-plate recycling."""
-    if state["native_plate_count"] != plate:
-        raise ValueError("Native layout spilled or changed the selected plate unexpectedly")
-    dimensions = state["bed_dimensions_mm"]
-    source = _plate_origin(plate - 1, state["source_plate_count"], dimensions)
-    native = _plate_origin(plate - 1, state["native_plate_count"], dimensions)
-    return {**state, "source_origin": source, "native_origin": native,
-            "world_correction": [source[i] - native[i] for i in range(3)]}
+    if plate != state['native_plate_count']:
+        raise ValueError('Native layout spilled or changed the selected plate unexpectedly')
+    dimensions = state['bed_dimensions_mm']
+    before = _plate_origin(plate - 1, state['source_plate_count'], dimensions)
+    after = _plate_origin(plate - 1, state['native_plate_count'], dimensions)
+    correction = list(_subtract(before, after))
+    return {**state, 'source_origin': before, 'native_origin': after, 'world_correction': correction}
 
 
 def _fit_plate(points: list[Point], origin: Sequence[float], dimensions: Sequence[float]) -> bool:
-    tolerance = _tolerance(points)
-    return all(origin[axis] - tolerance <= point[axis] <= origin[axis] + dimensions[axis] + tolerance
-               for point in points for axis in (0, 1))
+    allowance = _tolerance(points)
+    for axis in (0, 1):
+        low, high = min(vertex[axis] for vertex in points), max(vertex[axis] for vertex in points)
+        if low < origin[axis] - allowance or high > origin[axis] + dimensions[axis] + allowance:
+            return False
+    return True
 
 
-def _run(engine: Engine, project: Path, output: Path, arrange: bool, orient: bool, timeout: float, audit: AuditRecord, work: Path) -> Path:
-    output.mkdir()
-    datadir = output / "native-data"
-    datadir.mkdir()
-    stls = output / "stls"
-    command = [str(engine.executable), "--allow-newer-file", "--debug", "5", "--arrange", str(int(arrange)),
-               "--orient", str(int(orient)), "--ensure-on-bed=0", "--datadir", str(datadir),
-               "--outputdir", str(output), "--export-stls", str(stls)]
-    command.append(str(project))
-    env = {k: v for k, v in os.environ.items() if k not in (
-        "DISPLAY", "WAYLAND_DISPLAY", "BAMBU_ORCA_ALLOW_NEWER_FILE")}
-    env["LC_ALL"] = "C"
-    record: RunRecord = {"argv": command, "log_path": str(output / "engine.log"), "status": "running"}
-    audit["runs"].append(record)
+def _run(engine: Engine, project: Path, output: Path, arrange: bool, orient: bool,
+         timeout: float, audit: AuditRecord, work: Path) -> Path:
+    output.mkdir(mode=0o700)
+    data = output / 'native-data'
+    data.mkdir(mode=0o700)
+    destination = output / 'stls'
+    # export-stls is a directory-valued action in BambuStudio.cpp:6388.
+    # Do not invoke --slice/select_plate: CPU layout needs no GUI singleton.
+    command = [str(engine.executable), '--allow-newer-file', '--debug', '5',
+               '--arrange', '1' if arrange else '0', '--orient', '1' if orient else '0',
+               '--ensure-on-bed=0', '--datadir', str(data), '--outputdir', str(output),
+               '--export-stls', str(destination), str(project)]
+    record: RunRecord = dict(argv=command, log_path=str(output / 'engine.log'), status='running')
+    audit['runs'].append(record)
     _write_audit(work, audit)
     engine.verify()
     started = time.perf_counter()
     try:
-        with (output / "engine.log").open("w") as log:
-            process = subprocess.Popen(command, cwd=output, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                       start_new_session=(os.name != "nt"))
-            try:
-                code = process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired as error:
-                if os.name == "nt":
-                    subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                                   stdout=log, stderr=subprocess.STDOUT, check=False)
-                    if process.poll() is None:
-                        process.kill()
-                else:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                process.wait()
-                record["status"] = "timeout"
-                raise TimeoutError(f"Native edit timed out; diagnostics: {work}") from error
-        record["status"] = "complete" if not code else "failed"
-        record["exit_code"] = code
+        code, _ = run_command(command, output, timeout)
+        record['exit_code'] = code
+        record['status'] = 'failed' if code else 'complete'
+        if code:
+            raise RuntimeError(f'Native edit failed ({code}); diagnostics: {work}')
+    except TimeoutError:
+        record['status'] = 'timeout'
+        raise
+    except BaseException:
+        record['status'] = 'failed'
+        raise
     finally:
-        record["elapsed_seconds"] = time.perf_counter() - started
-        record["log_sha256"] = file_hash(output / "engine.log")
+        record['elapsed_seconds'] = time.perf_counter() - started
+        log = output / 'engine.log'
+        if log.is_file():
+            record['log_sha256'] = file_hash(log)
         engine.verify()
-    if code:
-        raise RuntimeError(f"Native edit failed ({code}); diagnostics: {work}")
-    return stls
+    return destination
+
+
+def _exports(directory: Path, expected: set[int], audit: AuditRecord) -> dict[int, list[Point]]:
+    measured: dict[int, list[Point]] = {}
+    ordinals: set[int] = set()
+    for path in sorted(directory.iterdir()):
+        match = re.fullmatch(r'obj_(\d+)_mcp_object_(\d+)\.stl', path.name)
+        if match is None or int(match[1]) in ordinals or int(match[2]) in measured:
+            raise ValueError('Unexpected or ambiguous native STL output')
+        ordinals.add(int(match[1]))
+        measured[int(match[2])] = _read_stl(path)
+        audit['artifacts'].append(dict(path=str(path), sha256=file_hash(path)))
+    if set(measured) != expected or ordinals != set(range(1, len(expected) + 1)):
+        raise ValueError('Native STL object count does not match the selected source roots')
+    return measured
+
+
+def _locked_check(key: InstanceKey, before: list[Point], after: list[Point], plate: int,
+                  state: LayoutState, audit: AuditRecord) -> None:
+    if plate > state['native_plate_count']:
+        raise ValueError('Native layout removed an occupied locked plate')
+    dimensions = state['bed_dimensions_mm']
+    old = _plate_origin(plate - 1, state['source_plate_count'], dimensions)
+    new = _plate_origin(plate - 1, state['native_plate_count'], dimensions)
+    correction = _subtract(new, old)
+    error = max(math.dist(tuple(vertex[i] + correction[i] for i in range(3)), target)
+                for vertex, target in zip(before, after))
+    if error > _tolerance(before, after) or not _fit_plate(after, new, dimensions):
+        raise ValueError("Native operation changed a locked instance's relative pose or plate fit")
+    audit.setdefault('locked_instances_verified', []).append(dict(
+        object_id=key[0], instance_id=key[1], plate=plate,
+        vertices_verified=len(before), relative_pose_error_mm=error))
 
 
 def native_deltas(engine: Engine, project: Path, work: Path, arrange: bool = False, orient: bool = False,
                   plate: int = 0, timeout: float = 1800) -> dict[tuple[int, int], list[float]]:
-    """Measure official arrange/orient deltas without re-exporting the 3MF.
+    """Measure arrange/orient with preserved root IDs and original instance ordinals.
 
-    ``work`` must have no previous native operation outputs. Plate numbers are
-    1-based; zero selects unlocked instances. Instance ordinals are original per-root build
-    ordinals, including when only one plate is selected. Other plate slots are
-    locked in the scratch subset so native arrange retains its plate frame.
-    Global arrange writes the observed final plate count and assignments for
-    returned deltas to ``native_ops.json["layout"]``. Locked instances stay as
-    native anchors and are verified separately; the caller reflows them to the
-    final grid. Selected-plate overflow fails explicitly. No G-code or
-    renderer/3MF export is requested. Every source baseline
-    triangle and every output vertex is verified; unsupported correspondence,
-    degenerate geometry and non-rigid results fail explicitly.
+    Baseline and edited exports must have identical facet correspondence. The
+    measured plate grid certifies global assignments and selected-plate reflow;
+    locked anchors are measured but never returned as edits. Source and native
+    input hashes must remain unchanged throughout the two native invocations.
     """
     if type(arrange) is not bool or type(orient) is not bool or not (arrange or orient):
-        raise ValueError("Request arrange and/or orient as booleans")
+        raise ValueError('Request arrange and/or orient as booleans')
     if type(plate) is not int or plate < 0:
-        raise ValueError("plate must be zero (all) or a positive plate number")
-    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError("timeout must be a finite positive number")
-    project, work = Path(project).resolve(strict=True), Path(work).resolve()
+        raise ValueError('plate must be zero (all) or a positive plate number')
+    if type(timeout) not in (float, int) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('timeout must be a finite positive number')
+    project = project.resolve(strict=True)
+    work = work.resolve()
     ensure_bambu_project(project)
     engine.verify()
-    source_hash = str(Sha256(file_hash(project)))
+    digest = file_hash(project)
     geometry = _Geometry(project)
-    if file_hash(project) != source_hash:
-        raise ValueError("Source changed while reading its geometry; retry a stable saved project")
-    locked = geometry.locked_instances()
-    selected = geometry.selected(plate, omit_locked=True)
-    if not plate and arrange and orient and locked:
-        raise ValueError("Combined global arrange/orient with locked plates requires separate per-plate operations")
-    included = {key for key, _ in geometry.items} if arrange and not plate else selected
-    work.mkdir(parents=True, exist_ok=True)
-    if any((work / name).exists() for name in ("native_input.3mf", "native_ops.json", "baseline", "edited")):
-        raise ValueError("Native operation scratch outputs already exist; choose a fresh work directory")
-    audit: AuditRecord = {"status": "running", "source_path": str(project), "source_sha256": source_hash,
-             "engine": json_object(engine.identity(), "Engine identity"), "arrange": arrange, "orient": orient, "plate": plate,
-             "compatibility_flags": {"allow_newer_file": True}, "runs": [], "artifacts": [], "instances": []}
+    if digest != file_hash(project):
+        raise ValueError('Source changed while reading its geometry; retry a stable saved project')
+    locked, selected = geometry.locked_instances(), geometry.selected(plate, omit_locked=True)
+    if arrange and orient and plate == 0 and locked:
+        raise ValueError('Combined global arrange/orient with locked plates requires separate per-plate operations')
+    included = {key for key, _ in geometry.items} if arrange and plate == 0 else selected
+    # Read geometry before native_input sanitizes the private export graph.
+    meshes = {oid: geometry.mesh(oid) for oid in geometry.instances if any(key[0] == oid for key in included)}
+    work.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if any((work / name).exists() for name in ('native_input.3mf', 'native_ops.json', 'baseline', 'edited')):
+        raise ValueError('Native operation scratch outputs already exist; choose a fresh work directory')
+    audit: AuditRecord = dict(status='running', source_path=str(project), source_sha256=digest,
+        engine=json_object(engine.identity()), arrange=arrange, orient=orient, plate=plate,
+        compatibility_flags={'allow_newer_file': True}, runs=[], artifacts=[], instances=[])
     _write_audit(work, audit)
     try:
-        native_input = work / "native_input.3mf"
-        meshes = {oid: geometry.mesh(oid) for oid in geometry.instances if any(k[0] == oid for k in included)}
-        groups = geometry.native_input(native_input, included)
-        input_hash = file_hash(native_input)
-        audit["native_input_sha256"] = input_hash
-        baseline = _run(engine, native_input, work / "baseline", False, False, timeout, audit, work)
-        edited = _run(engine, native_input, work / "edited", arrange, orient, timeout, audit, work)
-        layout_state = _layout_state(geometry, work / "edited" / "engine.log") if arrange else None
-        frame = _plate_frame(layout_state, plate) if layout_state is not None and plate else None
-        if frame:
-            audit["plate_frame"] = frame
-        elif layout_state:
-            audit["native_layout_state"] = layout_state
-            audit["layout"] = {"plate_count": layout_state["native_plate_count"], "instances": []}
-        if file_hash(project) != source_hash or file_hash(native_input) != input_hash:
-            raise ValueError("Source or native scratch input changed during the operation")
-        outputs = []
-        for directory in (baseline, edited):
-            indexed = {}
-            ordinals = set()
-            for path in directory.iterdir():
-                match = re.fullmatch(r"obj_(\d+)_mcp_object_(\d+)\.stl", path.name)
-                if not match or int(match[1]) in ordinals or int(match[2]) in indexed:
-                    raise ValueError("Unexpected or ambiguous native STL output")
-                ordinals.add(int(match[1]))
-                indexed[int(match[2])] = path
-                audit["artifacts"].append({"path": str(path), "sha256": file_hash(path)})
-            if ordinals != set(range(1, len(groups) + 1)) or set(indexed) != set(groups):
-                raise ValueError("Native STL object count does not match the selected source roots")
-            outputs.append(indexed)
-        result = {}
-        for oid, keys in groups.items():
-            # Native rebuild sorts ModelObjects by arrange_order. The sanitized
-            # root name remains its identity even when obj_N changes.
-            before, after = (_read_stl(output[oid]) for output in outputs)
-            per_instance = 3 * len(meshes[oid])
-            if len(before) != per_instance * len(keys) or len(after) != len(before):
-                raise ValueError("Native operation changed the object or instance facet count")
-            for index, key in enumerate(keys):
-                first, last = index * per_instance, (index + 1) * per_instance
-                source_points, target_points = before[first:last], after[first:last]
-                _verify_baseline(source_points, meshes[oid], geometry.instances[oid][key[1]])
+        native_input = work / 'native_input.3mf'
+        grouped = geometry.native_input(native_input, included)
+        input_digest = file_hash(native_input)
+        audit['native_input_sha256'] = input_digest
+        baseline = _exports(_run(engine, native_input, work / 'baseline', False, False, timeout, audit, work), set(grouped), audit)
+        edited = _exports(_run(engine, native_input, work / 'edited', arrange, orient, timeout, audit, work), set(grouped), audit)
+        state = _layout_state(geometry, work / 'edited/engine.log') if arrange else None
+        frame = _plate_frame(state, plate) if state is not None and plate else None
+        if frame is not None:
+            audit['plate_frame'] = frame
+        elif state is not None:
+            audit['native_layout_state'] = state
+            audit['layout'] = dict(plate_count=state['native_plate_count'], instances=[])
+        if file_hash(project) != digest or file_hash(native_input) != input_digest:
+            raise ValueError('Source or native scratch input changed during the operation')
+        result: dict[InstanceKey, list[float]] = {}
+        for oid, keys in grouped.items():
+            stride = 3 * len(meshes[oid])
+            if len(baseline[oid]) != len(keys) * stride or len(edited[oid]) != len(baseline[oid]):
+                raise ValueError('Native operation changed the object or instance facet count')
+            for ordinal, key in enumerate(keys):
+                start = ordinal * stride
+                before, after = baseline[oid][start:start + stride], edited[oid][start:start + stride]
+                _verify_baseline(before, meshes[oid], geometry.instances[oid][key[1]])
                 if key not in selected:
-                    assert layout_state is not None
-                    old_count, count = layout_state["source_plate_count"], layout_state["native_plate_count"]
-                    dimensions, locked_plate = layout_state["bed_dimensions_mm"], locked[key]
-                    if locked_plate > count:
-                        raise ValueError("Native layout removed an occupied locked plate")
-                    old_origin = _plate_origin(locked_plate - 1, old_count, dimensions)
-                    new_origin = _plate_origin(locked_plate - 1, count, dimensions)
-                    offset = [new_origin[i] - old_origin[i] for i in range(3)]
-                    error = max(math.dist(tuple(p[i] + offset[i] for i in range(3)), q)
-                                for p, q in zip(source_points, target_points))
-                    if error > _tolerance(source_points, target_points) or not _fit_plate(target_points, new_origin, dimensions):
-                        raise ValueError("Native operation changed a locked instance's relative pose or plate fit")
-                    audit.setdefault("locked_instances_verified", []).append(
-                        {"object_id": oid, "instance_id": key[1], "plate": locked_plate,
-                         "vertices_verified": per_instance, "relative_pose_error_mm": error})
+                    assert state is not None
+                    _locked_check(key, before, after, locked[key], state, audit)
                     continue
-                if frame:
-                    origin, dimensions = frame["native_origin"], frame["bed_dimensions_mm"]
-                    if not _fit_plate(target_points, origin, dimensions):
-                        raise ValueError("Native arranged geometry does not fit the selected plate")
-                    target_points = [tuple(point[i] + frame["world_correction"][i] for i in range(3))
-                                     for point in target_points]
-                elif layout_state:
-                    count, dimensions = layout_state["native_plate_count"], layout_state["bed_dimensions_mm"]
-                    candidates = [index + 1 for index in range(count)
-                                  if _fit_plate(target_points, _plate_origin(index, count, dimensions), dimensions)]
-                    if len(candidates) != 1:
-                        raise ValueError("Native arranged instance does not fit exactly one printable plate")
-                    audit["layout"]["instances"].append({"object_id": oid, "instance_id": key[1],
-                                                        "plate": candidates[0]})
-                matrix, error, tolerance = _recover(source_points, target_points)
-                result[key] = matrix
-                audit["instances"].append({"object_id": oid, "instance_id": key[1], "delta": matrix,
-                                           "vertices_verified": per_instance, "max_error_mm": error,
-                                           "tolerance_mm": tolerance})
+                if frame is not None:
+                    if not _fit_plate(after, frame['native_origin'], frame['bed_dimensions_mm']):
+                        raise ValueError('Native arranged geometry does not fit the selected plate')
+                    after = [tuple(vertex[i] + frame['world_correction'][i] for i in range(3)) for vertex in after]
+                elif state is not None:
+                    assignment = [index + 1 for index in range(state['native_plate_count'])
+                                  if _fit_plate(after, _plate_origin(index, state['native_plate_count'], state['bed_dimensions_mm']), state['bed_dimensions_mm'])]
+                    if len(assignment) != 1:
+                        raise ValueError('Native arranged instance does not fit exactly one printable plate')
+                    audit['layout']['instances'].append(dict(object_id=key[0], instance_id=key[1], plate=assignment[0]))
+                delta, error, tolerance = _recover(before, after)
+                result[key] = delta
+                audit['instances'].append(dict(object_id=key[0], instance_id=key[1], delta=delta,
+                                               vertices_verified=stride, max_error_mm=error, tolerance_mm=tolerance))
         engine.verify()
-        audit["status"] = "verified"
+        audit['status'] = 'verified'
         return result
-    except Exception as error:
-        audit["status"] = "failed"
-        audit["error"] = str(error)
+    except BaseException as error:
+        audit['status'] = 'failed'
+        audit['error'] = str(error)
         raise
     finally:
         _write_audit(work, audit)
 
 
 def _f32(value: float) -> float:
-    return float(struct.unpack("<f", struct.pack("<f", value))[0])
+    packed = struct.pack('<f', value)
+    rounded, = struct.unpack('<f', packed)
+    return float(rounded)
 
 
 def _number(config: Mapping[str, JsonValue], key: str, default: JsonValue) -> float:
     value = config.get(key, default)
     if isinstance(value, bool):
-        raise ValueError(f"Invalid numeric setting: {key}")
+        raise ValueError(f'Invalid numeric setting: {key}')
     try:
-        result = float(str(value).rstrip("%"))
+        number = float(str(value).removesuffix('%'))
     except (TypeError, ValueError) as error:
-        raise ValueError(f"Invalid numeric setting: {key}") from error
-    if not math.isfinite(result):
-        raise ValueError(f"Non-finite setting: {key}")
-    return result
+        raise ValueError(f'Invalid numeric setting: {key}') from error
+    if not math.isfinite(number):
+        raise ValueError(f'Non-finite setting: {key}')
+    return number
 
 
 def _numbers(config: Mapping[str, JsonValue], key: str, default: JsonValue) -> list[float]:
-    values = config.get(key, default)
-    if not isinstance(values, (list, tuple)):
-        values = re.split(r"[;,]", values) if isinstance(values, str) else [values]
+    supplied = config.get(key, default)
+    values = supplied if isinstance(supplied, list) else re.split('[;,]', supplied) if isinstance(supplied, str) else [supplied]
     if not values:
-        raise ValueError(f"Empty per-nozzle setting: {key}")
-    return [_number({key: value}, key, 0.) for value in values]
+        raise ValueError(f'Empty per-nozzle setting: {key}')
+    return [_number({key: item}, key, 0.) for item in values]
 
 
 def _height_ranges(geometry: _Geometry, object_id: int, minimum: float, maximum: float) -> list[tuple[float, float, float]]:
-    data = geometry.data.get("Metadata/layer_config_ranges.xml")
+    data = geometry.data.get('Metadata/layer_config_ranges.xml')
     if data is None:
         return []
-    # Official 3MF layer-config ranges use a legacy 1-based model-object index,
-    # even when the layer-height-profile file uses root object ids (version 2).
     ordinal = list(geometry.instances).index(object_id) + 1
+    selected = [obj for obj in ET.fromstring(data).findall('object') if int(obj.attrib['id']) == ordinal]
     ranges = []
-    for obj in ET.fromstring(data).findall("object"):
-        if int(obj.attrib["id"]) != ordinal:
-            continue
-        for node in obj.findall("range"):
-            low, high = float(node.attrib["min_z"]), float(node.attrib["max_z"])
-            options: dict[str, JsonValue] = {o.attrib["opt_key"]: o.text for o in node.findall("option")}
-            if "layer_height" not in options:
-                raise ValueError("Adaptive height ranges must contain layer_height")
-            height = _number(options, "layer_height", 0.)
-            if (not all(math.isfinite(n) for n in (low, high)) or low < 0 or low >= high
-                    or not minimum <= height <= maximum):
-                raise ValueError("Adaptive height range is outside the effective layer limits")
+    for obj in selected:
+        for entry in obj.findall('range'):
+            low, high = float(entry.attrib['min_z']), float(entry.attrib['max_z'])
+            options: JsonObject = {node.attrib['opt_key']: node.text for node in entry.findall('option')}
+            if 'layer_height' not in options:
+                raise ValueError('Adaptive height ranges must contain layer_height')
+            height = _number(options, 'layer_height', 0.)
+            if not (math.isfinite(low) and math.isfinite(high) and 0 <= low < high and minimum <= height <= maximum):
+                raise ValueError('Adaptive height range is outside the effective layer limits')
             ranges.append((low, high, height))
     return sorted(ranges)
 
 
-def adaptive_layer_profile(project_path: Path, object_id: int, config: JsonObject, quality: float) -> list[float]:
-    """Port the official 9bf2f18 adaptive profile algorithm without editing a file.
+@dataclass(frozen=True)
+class _FaceSpan:
+    bottom: float
+    top: float
+    cosine: float
+    sine: float
 
-    Sources: ``Slicing.cpp::layer_height_profile_adaptive``,
-    ``SlicingAdaptive.cpp::next_layer_height`` and ``SlicingParameters``. Quality
-    is the native 0..1 parameter (0 is finest). First-instance world geometry,
-    normal parts, raft first-layer behavior, nozzle defaults, explicit height
-    ranges and the 0.04 mm height-change limit follow the official algorithm.
+    @classmethod
+    def measure(cls, triangle: Triangle) -> _FaceSpan:
+        normal = _unit(_cross(_subtract(triangle[1], triangle[0]), _subtract(triangle[2], triangle[0])))
+        x, y, z = map(_f32, normal)
+        levels = [point[2] for point in triangle]
+        return cls(min(levels), max(levels), abs(z), _f32(math.sqrt(_f32(_f32(x * x) + _f32(y * y)))))
 
-    This port supports uniform per-nozzle limits and 100% Z compensation. Mixed
-    nozzle limits or non-default shrinkage need a native parameter adapter and
-    fail explicitly rather than silently approximating extruder selection.
-    The caller persists only the returned profile in its original graph.
-    """
-    if type(quality) not in (int, float) or not math.isfinite(quality) or not 0 <= quality <= 1:
-        raise ValueError("quality must be a finite native parameter in 0..1 (0 is finest)")
-    if type(object_id) is not int or not isinstance(config, dict):
-        raise ValueError("Specify a root object id and effective configuration")
-    project_path = Path(project_path).resolve(strict=True)
-    geometry = _Geometry(project_path)
-    if object_id not in geometry.instances:
-        raise ValueError("Unknown source root object id")
-    settings = geometry.object_settings.get(object_id)
-    effective = {**config, **(_metadata(settings) if settings is not None else {})}
-    layer = _number(effective, "layer_height", 0.2)
-    first = _number(effective, "initial_layer_print_height", 0.2)
-    if first <= 0:
-        first = layer
-    nozzles = _numbers(effective, "nozzle_diameter", [0.4])
-    minima = _numbers(effective, "min_layer_height", [0.])
-    maxima = _numbers(effective, "max_layer_height", [0.])
-    if any(len(set(round(n, 12) for n in values)) != 1 for values in (nozzles, minima, maxima)):
-        raise ValueError("Adaptive profile currently requires uniform per-nozzle layer limits")
-    if any(n != 100. for n in _numbers(effective, "filament_shrinkage_compensation_z", [100.])):
-        raise ValueError("Adaptive profile with non-default Z shrinkage compensation is unsupported")
-    nozzle, minimum, maximum = nozzles[0], minima[0], maxima[0]
-    if nozzle <= 0 or minimum < 0 or maximum < 0 or layer <= 0 or first <= 0:
-        raise ValueError("Layer and nozzle dimensions must be positive")
-    minimum = 0.07 if minimum == 0 else max(0.01, minimum)
-    maximum = max(minimum, 0.75 * nozzle if maximum == 0 else maximum)
-    minimum, maximum = min(minimum, layer), max(maximum, layer)
-    raft = _number(effective, "raft_layers", 0.)
-    if raft < 0 or not raft.is_integer():
-        raise ValueError("raft_layers must be a non-negative integer")
-    if raft:
-        first = layer
-    instance = geometry.instances[object_id][0]
-    triangles = [tuple(tuple(_f32(n) for n in _point(vertex, instance)) for vertex in triangle)
-                 for triangle in geometry.mesh(object_id)]
-    object_height = _f32(max(p[2] for triangle in triangles for p in triangle))
-    if object_height <= 0:
-        raise ValueError("Adaptive profiling requires object geometry above Z=0")
-    faces = []
-    for triangle in triangles:
-        normal = _cross(_subtract(triangle[1], triangle[0]), _subtract(triangle[2], triangle[0]))
-        length = math.sqrt(_dot(normal, normal))
-        if length == 0:
-            raise ValueError("Adaptive profiling requires non-degenerate facets")
-        normal = tuple(_f32(n / length) for n in normal)
-        z = [p[2] for p in triangle]
-        faces.append((min(z), max(z), abs(normal[2]), _f32(math.hypot(normal[0], normal[1]))))
-    faces.sort(key=lambda f: f[:2])
-    ranges = _height_ranges(geometry, object_id, minimum, maximum)
-    quality = _f32(quality)
-    deviation = _f32(minimum + (layer - minimum) * 2 * quality if quality < .5
-                     else maximum + (layer - maximum) * 2 * (1 - quality))
+    def cusp(self, deviation: float) -> float:
+        roughness = _f32(deviation / _f32(.184))
+        if self.cosine <= 1e-5:
+            return roughness
+        return min(roughness, _f32(1.44 * deviation * math.sqrt(_f32(self.sine / self.cosine))))
 
-    def slope_height(face: tuple[float, float, float, float]) -> float:
-        cosine, sine = face[2:]
-        slope = _f32(1.44 * deviation * math.sqrt(_f32(sine / cosine))) if cosine > 1e-5 else math.inf
-        return min(_f32(deviation / _f32(.184)), slope)
 
-    current_facet = 0
+class _AdaptiveSweep:
+    """Bambu SlicingAdaptive::next_layer_height's sorted facet event sweep."""
+    def __init__(self, triangles: list[Triangle], minimum: float, maximum: float, deviation: float):
+        self.faces = sorted((_FaceSpan.measure(face) for face in triangles), key=lambda f: (f.bottom, f.top))
+        self.minimum, self.maximum, self.deviation = _f32(minimum), _f32(maximum), _f32(deviation)
+        self.cursor = 0
 
-    def next_height(print_z: float) -> float:
-        nonlocal current_facet
-        height, first_hit, index = _f32(maximum), False, current_facet
-        while index < len(faces):
-            face = faces[index]
-            if face[0] >= print_z:
-                break
-            if face[1] > print_z:
-                if not first_hit:
-                    first_hit, current_facet = True, index
-                if face[1] >= print_z + 1e-4:
-                    height = min(height, slope_height(face))
+    def next(self, previous_top: float) -> float:
+        z = _f32(previous_top)
+        height, index = self.maximum, self.cursor
+        first: int | None = None
+        while index < len(self.faces) and self.faces[index].bottom < z:
+            face = self.faces[index]
+            if face.top > z:
+                if first is None:
+                    first = index
+                if face.top >= z + .0001:
+                    height = min(height, face.cusp(self.deviation))
             index += 1
-        height = max(height, _f32(minimum))
-        if height > _f32(minimum):
-            while index < len(faces):
-                face = faces[index]
-                if face[0] >= _f32(print_z + height):
-                    break
-                if face[1] >= print_z + 1e-4:
-                    reduced = slope_height(face)
-                    distance = _f32(face[0] - print_z)
-                    if reduced < distance:
-                        height = distance
-                    elif reduced < height:
-                        height = reduced
-                index += 1
-            height = max(height, _f32(minimum))
+        if first is not None:
+            self.cursor = first
+        height = max(height, self.minimum)
+        while height > self.minimum and index < len(self.faces):
+            face = self.faces[index]
+            if face.bottom >= _f32(z + height):
+                break
+            if face.top >= z + .0001:
+                cusp, distance = face.cusp(self.deviation), _f32(face.bottom - z)
+                height = distance if cusp < distance else min(cusp, height)
+                height = max(height, self.minimum)
+            index += 1
         return height
 
-    profile = [0., first]
-    if not raft:
-        profile.extend([first, first])
-    print_z = first
-    while print_z + 1e-4 < object_height:
-        height = min(_f32(maximum), next_height(_f32(print_z)))
-        if abs(profile[-1] - height) > .04:
-            height = _f32(profile[-1] + (.04 if profile[-1] < height else -.04))
-        for low, high, override in ranges:
-            if low <= print_z <= high:
-                height = _f32(override)
-                break
-        profile.extend([print_z, height])
-        print_z += height
-    gap = object_height - profile[-2]
+
+def adaptive_layer_profile(project_path: Path, object_id: int, config: JsonObject, quality: float) -> list[float]:
+    """Generate a Bambu profile for uniform nozzles and unmodified Z scale.
+
+    Source: BambuStudio 926a719 Slicing.cpp:247–337 and SlicingAdaptive.cpp:72–198.
+    Bambu's generation ignores explicit ranges; this API intentionally overlays
+    them after the cusp/gradation step to preserve user-authored height ranges.
+    The editor gates this source-derived generator against the bound engine SHA.
+    """
+    if type(quality) not in (int, float) or not math.isfinite(quality) or not 0 <= quality <= 1:
+        raise ValueError('quality must be a finite native parameter in 0..1 (0 is finest)')
+    if type(object_id) is not int or not isinstance(config, dict):
+        raise ValueError('Specify a root object id and effective configuration')
+    geometry = _Geometry(project_path.resolve(strict=True))
+    if object_id not in geometry.instances:
+        raise ValueError('Unknown source root object id')
+    node = geometry.object_settings.get(object_id)
+    settings = dict(config)
+    if node is not None:
+        settings.update(_metadata(node))
+    nominal = _number(settings, 'layer_height', .2)
+    first = _number(settings, 'initial_layer_print_height', .2)
+    if first <= 0:
+        first = nominal
+    defaults: list[tuple[str, JsonValue]] = [('nozzle_diameter', [.4]), ('min_layer_height', [0.]), ('max_layer_height', [0.])]
+    vectors = [_numbers(settings, name, default) for name, default in defaults]
+    if any(any(abs(item - values[0]) > 1e-12 for item in values) for values in vectors):
+        raise ValueError('Adaptive profile currently requires uniform per-nozzle layer limits')
+    if any(item != 100. for item in _numbers(settings, 'filament_shrinkage_compensation_z', [100.])):
+        raise ValueError('Adaptive profile with non-default Z shrinkage compensation is unsupported')
+    nozzle, low, high = (values[0] for values in vectors)
+    if nozzle <= 0 or low < 0 or high < 0 or nominal <= 0 or first <= 0:
+        raise ValueError('Layer and nozzle dimensions must be positive')
+    minimum = .07 if low == 0 else max(.01, low)
+    maximum = max(minimum, .75 * nozzle if high == 0 else high)
+    minimum, maximum = min(minimum, nominal), max(maximum, nominal)
+    raft = _number(settings, 'raft_layers', 0.)
+    if raft < 0 or not raft.is_integer():
+        raise ValueError('raft_layers must be a non-negative integer')
+    if raft:
+        first = nominal
+    pose = geometry.instances[object_id][0]
+    triangles = [tuple(tuple(_f32(value) for value in _point(point, pose)) for point in face)
+                 for face in geometry.mesh(object_id)]
+    top = max(vertex[2] for face in triangles for vertex in face)
+    if top <= 0:
+        raise ValueError('Adaptive profiling requires object geometry above Z=0')
+    ranges = _height_ranges(geometry, object_id, minimum, maximum)
+    q = _f32(quality)
+    endpoint, factor = (minimum, 2 * q) if q < .5 else (maximum, 2 * (1 - q))
+    sweep = _AdaptiveSweep(triangles, minimum, maximum, endpoint + (nominal - endpoint) * factor)
+    profile = [0., first] if raft else [0., first, first, first]
+    z = first
+    while z + .0001 < top:
+        height = min(_f32(maximum), sweep.next(z))
+        previous = profile[-1]
+        if abs(height - previous) > .04:
+            height = _f32(previous + math.copysign(.04, height - previous))
+        override = next((value for low, high, value in ranges if low <= z <= high), None)
+        if override is not None:
+            height = _f32(override)
+        profile.extend((z, height))
+        z += height
+    gap = top - profile[-2]
     if gap > 0:
-        profile.extend([object_height, max(minimum, min(gap, maximum))])
+        profile.extend((top, min(maximum, max(minimum, gap))))
     return profile

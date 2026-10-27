@@ -1,4 +1,4 @@
-"""Compatibility host for the composed headless slicing application."""
+"""Stable slicing facade over the application and Bambu CLI boundary."""
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
@@ -15,6 +15,7 @@ from ...domain.types.json import JsonObject
 from ..storage.artifacts import FilesystemArtifacts
 from .engine import Engine
 from .project_format import ensure_bambu_project
+from .runner import BambuProcess
 
 P = ParamSpec('P')
 T = TypeVar('T')
@@ -25,13 +26,13 @@ class Slicer:
                  admission: NativeAdmission | None = None,
                  artifacts: FilesystemArtifacts | None = None,
                  runner: NativeRunner | None = None) -> None:
-        from ...bootstrap import slicing_parts
-        parts = slicing_parts(engine, root)
-        self.engine, self.timeout = engine, timeout
-        self.artifacts = artifacts if artifacts is not None else parts.artifacts
+        self.engine = engine
+        self.timeout = timeout
+        self.artifacts = FilesystemArtifacts(root) if artifacts is None else artifacts
         self.root = self.artifacts.root
-        self.admission = admission if admission is not None else parts.admission
-        self.application = Slicing(engine, self.artifacts, runner if runner is not None else parts.runner, self.admission)
+        self.admission = NativeAdmission() if admission is None else admission
+        native = BambuProcess(engine.executable) if runner is None else runner
+        self.application = Slicing(engine, self.artifacts, native, self.admission)
 
     @contextmanager
     def native_session(self) -> Iterator[None]:
@@ -49,9 +50,11 @@ class Slicer:
 
     def slice_3mf(self, input_3mf: str, plate: int = 0, force: bool = False,
                   allow_newer_file: bool = True) -> JsonObject:
-        SliceRequest(plate, force, allow_newer_file)
-        ensure_bambu_project(Path(input_3mf).expanduser().resolve(strict=True))
-        return self.application.slice_3mf(input_3mf, plate, force, allow_newer_file, timeout=self.timeout)
+        request = SliceRequest(plate=plate, force=force, allow_newer_file=allow_newer_file)
+        source = Path(input_3mf).expanduser().resolve(strict=True)
+        ensure_bambu_project(source)
+        return self.application.slice_3mf(input_3mf, request.plate, request.force,
+                                         request.allow_newer_file, timeout=self.timeout)
 
     def recover_3mf(self, gcode_file: str) -> JsonObject:
         return self.artifacts.recover_3mf(gcode_file)
