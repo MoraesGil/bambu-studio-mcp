@@ -32,10 +32,13 @@ async def test_async_admission_shares_the_synchronous_gate():
         with admission.session():
             entered.set()
             assert release.wait(3)
+    def second_native_stage():
+        with admission.session():
+            second_entered.set()
     first_thread = threading.Thread(target=first)
     first_thread.start()
     assert await asyncio.to_thread(entered.wait, 3)
-    second = asyncio.create_task(admission.run(second_entered.set))
+    second = asyncio.create_task(admission.run(second_native_stage))
     try:
         assert not await asyncio.to_thread(second_entered.wait, 0.1)
     finally:
@@ -102,3 +105,43 @@ def test_rename_rolls_back_new_draft_when_old_path_becomes_a_symlink(tmp_path):
         repository.remove(record, rollback_path=replacement, action='rename')
     assert not Path(replacement).exists()
     assert file_hash(installed) == original_hash
+
+
+def test_async_project_snapshot_and_native_edit_do_not_invert_locks(tmp_path):
+    """A use case may capture a revision before entering the native session."""
+    import subprocess
+    import sys
+    probe = tmp_path / 'lock-order.py'
+    probe.write_text('''
+import asyncio, threading
+from bambu_studio_mcp.application.services.admission import NativeAdmission
+admission = NativeAdmission()
+repository = threading.RLock()
+owned = threading.Event()
+callback = threading.Event()
+def edit():
+    with repository:
+        owned.set()
+        assert callback.wait(2)
+        with admission.session():
+            pass
+def capture_and_slice():
+    callback.set()
+    with repository:
+        snapshot = 'revision'
+    with admission.session():
+        return snapshot
+async def main():
+    editor = threading.Thread(target=edit, daemon=True)
+    editor.start()
+    assert await asyncio.to_thread(owned.wait, 2)
+    assert await admission.run(capture_and_slice) == 'revision'
+    editor.join(2)
+    assert not editor.is_alive()
+asyncio.run(main())
+''')
+    try:
+        result = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True, timeout=4)
+    except subprocess.TimeoutExpired:
+        pytest.fail('Async admission inverted repository/native lock order and deadlocked')
+    assert result.returncode == 0, result.stdout + result.stderr

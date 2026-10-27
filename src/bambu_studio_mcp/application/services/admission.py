@@ -14,8 +14,9 @@ T = TypeVar('T')
 
 class NativeAdmission:
     def __init__(self) -> None:
-        # Reentrancy lets a transport admit a use case which also opens a native
-        # session. The same lock works across threads and independent event loops.
+        # Only the actual native stage takes this lock. A queued use case may
+        # first acquire the revision repository, as native edits already do.
+        # Holding this lock around that snapshot would invert their lock order.
         self._native = threading.RLock()
         self._queues: weakref.WeakValueDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = weakref.WeakValueDictionary()
         self._queues_lock = threading.Lock()
@@ -29,9 +30,6 @@ class NativeAdmission:
             self._native.release()
 
     async def run(self, function: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
-        def invoke() -> T:
-            with self.session():
-                return function(*args, **kwargs)
         loop = asyncio.get_running_loop()
         with self._queues_lock:
             queue = self._queues.setdefault(loop, asyncio.Lock())
@@ -40,7 +38,7 @@ class NativeAdmission:
             # Queue coroutines before occupying executor workers, so read-only
             # requests retain executor capacity during a long native run.
             async with queue:
-                return await asyncio.to_thread(invoke)
+                return await asyncio.to_thread(function, *args, **kwargs)
 
         worker = asyncio.create_task(admitted())
         # Shielding keeps admission until the worker actually exits. Consuming
