@@ -47,12 +47,13 @@ OpenAPI paths. Review intentional changes to the checked-in contract fixture.
 SDK-v1 interoperability runs in an isolated consumer environment; it does not
 change the service's SDK dependency or establish native engine semantics.
 
-The current required native suite contains **13 cases**: ten named setting
-effects, a regional modifier, a create/edit/slice workflow and a layout workflow.
-These cases do not cover all 35 tools or all 679 catalog settings. In particular,
-there is no claim of complete GUI parity or full native feature acceptance.
-The implementation still reuses Snapmaker wrapper code; passing contract tests
-does not turn that reuse into an independently validated Bambu implementation.
+The required native suite contains **15 cases**: ten named setting effects, a
+regional modifier, create/edit/slice, layout, adaptive profiles and a public MCP
+workflow. The latter calls all 35 tools through an actual stdio client, verifies
+saved revisions and preserved inputs, and slices the final X1C/PLA project.
+It does not cover every mode/value, all 679 settings, every printer, GUI parity
+or physical printing. The retained declarations/types are API contracts; runtime
+subsystems were reimplemented for Bambu. See [implementation scope](docs/implementation.md).
 
 ## Required native macOS integration
 
@@ -114,11 +115,12 @@ No test in this workflow sends a print job.
 
 ## Adaptive layers and benchmarks
 
-The adaptive mathematical port is inherited from the Snapmaker source. Its pure
-Python regression tests preserve the original numerical contract; they do not
-prove equivalence to Bambu `926a719`. The public adaptive generator remains
-explicitly unavailable until separately validated. Reset and height-range
-persistence are independent behaviors.
+Adaptive generation derives from Bambu `926a719` Slicing.cpp and
+SlicingAdaptive.cpp. The wrapper overlays explicit ranges after generation;
+that overlay is an explicit wrapper behavior. Native tests inspect outer-wall
+extrusion Z spacing on synthetic geometry: fine/coarse profiles, a fixed .12 mm
+range and reset. They also preserve the source hash. They do not prove every
+nozzle configuration or full GUI equivalence.
 
 `scripts/benchmark_wrapper.py` can compare deterministic synthetic fixtures with
 an explicitly bound Bambu app. It reports synchronous wrapper latency and Python

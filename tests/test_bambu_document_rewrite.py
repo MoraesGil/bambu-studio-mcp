@@ -90,3 +90,29 @@ def test_native_selection_reindexes_ordinal_height_metadata(tmp_path):
     selected = Project(target)
     assert selected.get_layer_profile(20) == [0, .1, 1, .1, 2, .2]
     assert selected.data[PROFILE].startswith(b'object_id=1|')
+
+
+def test_native_face_count_metadata_survives_inspection_and_edit(tmp_path):
+    import zipfile
+    from xml.etree import ElementTree as ET
+    from test_editor import project
+    from bambu_studio_mcp.project import Project
+    source = project(tmp_path / 'native-metadata.3mf')
+    with zipfile.ZipFile(source) as archive:
+        entries = {name: archive.read(name) for name in archive.namelist()}
+    settings = ET.fromstring(entries['Metadata/model_settings.config'])
+    ET.SubElement(settings.find('object'), 'metadata', {'face_count': '12'})
+    entries['Metadata/model_settings.config'] = ET.tostring(settings)
+    with zipfile.ZipFile(source, 'w') as archive:
+        for name, payload in entries.items():
+            archive.writestr(name, payload)
+    original = source.read_bytes()
+    document = Project(source)
+    assert document.describe()['objects'][0]['object_id'] == 2
+    document.set_config({'layer_height': '0.16'})
+    target = tmp_path / 'edited.3mf'
+    document.save(target)
+    with zipfile.ZipFile(target) as archive:
+        saved = ET.fromstring(archive.read('Metadata/model_settings.config'))
+        assert saved.find('object/metadata[@face_count="12"]') is not None
+    assert source.read_bytes() == original

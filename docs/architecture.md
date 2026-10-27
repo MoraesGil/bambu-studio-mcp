@@ -1,7 +1,9 @@
 # Python service architecture
 
-This is a separate Bambu adaptation of the public Snapmaker wrapper. No shared
-`slicer-mcp-core` package has been extracted. The native Bambu engine performs
+This Bambu implementation retains the public Snapmaker wrapper's organization,
+API declarations and compatibility types. Runtime subsystems were reimplemented
+for Bambu; [implementation scope](implementation.md) records the boundaries.
+No shared `slicer-mcp-core` package has been extracted. The native Bambu engine performs
 slicing and initial mesh-to-3MF project generation in its own process. The Bash
 launcher remains independent of the Python service.
 
@@ -35,9 +37,11 @@ presets remain read-only. Each committed revision is already a saved 3MF at its
 returned path; no separate MCP export endpoint is required.
 
 Native arrangement/orientation measure exported STL poses and certify affine
-deltas before applying them to the preserved graph. The adaptive mathematical
-port is inherited; its public generator rejects Bambu bindings until validated.
-Pure mathematical tests do not establish Bambu native compatibility.
+deltas before applying them to the preserved graph. Adaptive generation follows
+the pinned Bambu Slicing/SlicingAdaptive source, with explicit range overlay as
+wrapper behavior. Profiles are stored in Bambu's native ordinal format; old
+wrapper version-2 root-ID records are read and migrated on save. Native tests
+observe fine/coarse/reset layer spacing and an explicit height band.
 
 ## Native execution and storage
 
@@ -65,6 +69,11 @@ eight slicing/artifact OpenAPI paths on the same authenticated listener; creatio
 and revision editing use MCP/Python, with a CLI create command for mesh inputs.
 Golden tests compare schemas/discovery/errors across stdio and HTTP. Framework
 updates do not authorize an accidental public contract change.
+
+Tool declarations contain signatures and documentation without executable
+implementations. A dispatcher binds them to the Bambu application capabilities.
+The REST OpenAPI document is a packaged contract, checked against consumer
+fixtures independently of the request handlers.
 
 Strict typing checks the first-party package and deliberate invalid consumer
 examples. SDK-v1 interop uses an isolated client environment. These checks use

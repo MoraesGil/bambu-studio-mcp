@@ -1,17 +1,10 @@
-"""Preserve the published SDK-v1 wire contract on standalone FastMCP.
-
-Schemas come from typed callables; validation and execution share one adapter.
-FastMCP's presentation metadata and output-schema inference are deliberately
-omitted because existing consumers never received those optional fields.
-"""
+"""Compatibility codec for the published MCP envelopes on FastMCP 4."""
 from __future__ import annotations
 
 import inspect
 import json
 from collections.abc import Awaitable, Callable
 from typing import ParamSpec, cast
-from typing_extensions import TypeForm
-from pydantic_core import InitErrorDetails
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import NotFoundError, ResourceError, ToolError
@@ -23,114 +16,131 @@ from mcp import types
 from mcp.shared.exceptions import MCPError
 from pydantic import Field, TypeAdapter, ValidationError
 from pydantic.json_schema import SkipJsonSchema
+from pydantic_core import InitErrorDetails
+from typing_extensions import TypeForm
 
-from ...domain.types.json import JsonObject, JsonValue, json_object
+from ...domain.types.json import JsonObject, JsonValue, decode_json, json_object
 
 ToolValue = JsonObject | None
 P = ParamSpec('P')
 R = ParamSpec('R')
 
 
+def _content(value: ToolValue) -> list[types.ContentBlock]:
+    if value is None:
+        return []
+    serialized = json.dumps(value, ensure_ascii=False, indent=2)
+    return [types.TextContent(type='text', text=serialized)]
+
+
 class ContractTool(Tool):
     invoke: SkipJsonSchema[Callable[[JsonObject], Awaitable[ToolValue]]] = Field(exclude=True)
 
     def to_mcp_tool(self, **overrides: JsonValue) -> types.Tool:
-        return types.Tool(name=self.name, description=self.description, input_schema=self.parameters)
+        declaration = {'name': self.name, 'description': self.description,
+                       'input_schema': self.parameters}
+        return types.Tool.model_validate(declaration)
 
     async def run(self, arguments: JsonObject) -> ToolResult:
         try:
-            value = await self.invoke(arguments)
-        except Exception as error:
-            raise ToolError(f'Error executing tool {self.name}: {error}') from error
-        if value is None:
-            return ToolResult(content=[])
-        return ToolResult(content=[types.TextContent(type='text', text=json.dumps(value, indent=2, ensure_ascii=False))])
+            result = await self.invoke(arguments)
+        except Exception as failure:
+            message = f'Error executing tool {self.name}: {failure}'
+            raise ToolError(message) from failure
+        return ToolResult(content=_content(result))
 
 
 class ContractTemplate(FunctionResourceTemplate):
     def to_mcp_template(self, **overrides: JsonValue) -> types.ResourceTemplate:
-        return types.ResourceTemplate(name=self.name, uri_template=self.uri_template,
-                                      description=self.description, mime_type=self.mime_type)
+        declaration = dict(name=self.name, uri_template=self.uri_template,
+                           description=self.description, mime_type=self.mime_type)
+        return types.ResourceTemplate.model_validate(declaration)
 
 
 class LegacyErrors(Middleware):
     async def on_call_tool(self, context: MiddlewareContext[types.CallToolRequestParams],
                            call_next: CallNext[types.CallToolRequestParams, ToolResult]) -> ToolResult:
         try:
-            return await call_next(context)
+            result = await call_next(context)
         except NotFoundError:
-            return ToolResult(content=[types.TextContent(type='text', text=f'Unknown tool: {context.message.name}')],
-                              is_error=True)
-
+            contents = types.TextContent(type='text', text='Unknown tool: ' + context.message.name)
+            return ToolResult(content=[contents], is_error=True)
+        return result
 
     async def on_read_resource(self, context: MiddlewareContext[types.ReadResourceRequestParams],
                                call_next: CallNext[types.ReadResourceRequestParams, ResourceResult]) -> ResourceResult:
         try:
-            return await call_next(context)
-        except NotFoundError as error:
-            raise MCPError(0, f'Unknown resource: {context.message.uri}') from error
-        except ResourceError as error:
-            # SDK-v1 wrapped template failures at creation and manager boundaries.
-            # Unwrap framework envelopes only, retaining application error text.
-            cause: BaseException = error
-            while isinstance(cause, ResourceError) and cause.__cause__ is not None:
-                cause = cause.__cause__
-            raise MCPError(0, 'Error creating resource from template: '
-                           f'Error creating resource from template: {cause}') from error
+            result = await call_next(context)
+        except NotFoundError as failure:
+            message = 'Unknown resource: ' + str(context.message.uri)
+            raise MCPError(0, message) from failure
+        except ResourceError as failure:
+            leaf: BaseException = failure
+            while isinstance(leaf, ResourceError):
+                if leaf.__cause__ is None:
+                    break
+                leaf = leaf.__cause__
+            envelope = 'Error creating resource from template: '
+            raise MCPError(0, envelope * 2 + str(leaf)) from failure
+        return result
+
+
+def _arguments(arguments: JsonObject, fields: JsonObject) -> JsonObject:
+    accepted = {key: value for key, value in arguments.items() if key in fields}
+    for key in accepted:
+        supplied = accepted[key]
+        if isinstance(supplied, str) and json_object(fields[key]).get('type') != 'string':
+            try:
+                parsed = decode_json(supplied)
+            except ValueError:
+                continue
+            if parsed is None or isinstance(parsed, (list, dict, bool)):
+                accepted[key] = parsed
+    return accepted
+
+
+def _validation_error(error: ValidationError, title: str) -> ValidationError:
+    entries: list[InitErrorDetails] = []
+    for failure in error.errors(include_url=False):
+        detail: InitErrorDetails = dict(type=failure['type'], loc=failure['loc'], input=failure.get('input'))
+        if failure['type'] == 'missing_argument':
+            detail['type'] = 'missing'
+        if 'ctx' in failure:
+            detail['ctx'] = failure['ctx']
+        entries.append(detail)
+    return ValidationError.from_exception_data(title, entries)
 
 
 def register_tool(server: FastMCP[None]) -> Callable[[Callable[P, ToolValue | Awaitable[ToolValue]]], Callable[P, ToolValue | Awaitable[ToolValue]]]:
-    def decorate(function: Callable[P, ToolValue | Awaitable[ToolValue]]) -> Callable[P, ToolValue | Awaitable[ToolValue]]:
-        name = function.__name__
-        # Pydantic accepts function call schemas at runtime, although its
-        # TypeForm-only constructor annotation cannot express that documented API.
-        adapter: TypeAdapter[ToolValue | Awaitable[ToolValue]] = TypeAdapter(cast(TypeForm[ToolValue | Awaitable[ToolValue]], function))
-        schema = json_object(adapter.json_schema())
-        schema.pop('additionalProperties', None)
-        schema['title'] = f'{name}Arguments'
+    def install(declaration: Callable[P, ToolValue | Awaitable[ToolValue]]) -> Callable[P, ToolValue | Awaitable[ToolValue]]:
+        adapter = TypeAdapter(cast(TypeForm[ToolValue | Awaitable[ToolValue]], declaration))
+        specification = json_object(adapter.json_schema())
+        title = declaration.__name__ + 'Arguments'
+        specification.update(title=title)
+        specification.pop('additionalProperties', None)
+        fields = json_object(specification['properties'])
 
-        properties = json_object(schema['properties'])
-
-        async def invoke(arguments: JsonObject) -> ToolValue:
-            # SDK-v1 ignored unknown keys and decoded JSON collections supplied
-            # as strings by clients, while plain string arguments stayed literal.
-            converted: JsonObject = {}
-            for key, value in arguments.items():
-                if key not in properties:
-                    continue
-                field = json_object(properties[key])
-                if isinstance(value, str) and field.get('type') != 'string':
-                    try:
-                        parsed: JsonValue = json.loads(value)
-                    except ValueError:
-                        pass
-                    else:
-                        if not isinstance(parsed, (str, int, float)):
-                            value = parsed
-                converted[key] = value
+        async def execute(arguments: JsonObject) -> ToolValue:
             try:
-                result = adapter.validate_python(converted)
-            except ValidationError as error:
-                details: list[InitErrorDetails] = []
-                for detail in error.errors(include_url=False):
-                    item: InitErrorDetails = {'type': 'missing' if detail['type'] == 'missing_argument' else detail['type'],
-                                             'loc': detail['loc'], 'input': detail.get('input')}
-                    if 'ctx' in detail:
-                        item['ctx'] = detail['ctx']
-                    details.append(item)
-                raise ValidationError.from_exception_data(f'{name}Arguments', details) from error
-            if inspect.isawaitable(result):
-                return await result
-            return result
+                result = adapter.validate_python(_arguments(arguments, fields))
+            except ValidationError as failure:
+                raise _validation_error(failure, title) from failure
+            return await result if inspect.isawaitable(result) else result
 
-        server.add_tool(ContractTool(name=name, description=inspect.cleandoc(function.__doc__ or '') + ('\n' if '\n' in (function.__doc__ or '') else ''),
-                                     parameters=schema, invoke=invoke))
-        return function
-    return decorate
+        documentation = declaration.__doc__ or ''
+        description = inspect.cleandoc(documentation)
+        if '\n' in documentation:
+            description += '\n'
+        tool = ContractTool(name=declaration.__name__, description=description,
+                            parameters=specification, invoke=execute)
+        server.add_tool(tool)
+        return declaration
+    return install
 
 
 def register_resource(server: FastMCP[None], uri: str) -> Callable[[Callable[R, str]], Callable[R, str]]:
-    def decorate(function: Callable[R, str]) -> Callable[R, str]:
-        server.add_template(ContractTemplate.from_function(function, uri_template=uri, description=''))
-        return function
-    return decorate
+    def install(declaration: Callable[R, str]) -> Callable[R, str]:
+        resource = ContractTemplate.from_function(declaration, uri_template=uri, description='')
+        server.add_template(resource)
+        return declaration
+    return install

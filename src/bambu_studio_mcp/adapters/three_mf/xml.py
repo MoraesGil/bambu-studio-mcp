@@ -28,7 +28,9 @@ def child(parent: ET.Element | None, tag: str) -> ET.Element | None:
 def metadata(parent: ET.Element | None) -> dict[str, str]:
     values: dict[str, str] = {}
     for node in children(parent, 'metadata'):
-        values[node.attrib['key']] = node.get('value', '')
+        key = node.get('key')
+        if key is not None:
+            values[key] = node.get('value', '')
     return values
 
 

@@ -8,12 +8,13 @@ This independent community project invokes the official native Bambu Studio CLI.
 It provides a small Bash launcher and an optional Python CLI, MCP server and REST
 service. It does not connect to a printer or open the slicer GUI.
 
-**Experimental adaptation.** This implementation reuses code from the Snapmaker
-wrapper; it is not a structure-only copy or a complete independent rewrite.
-Native macOS validation currently exercises 13 cases: ten setting effects,
-one regional modifier, one create/edit/slice workflow and one layout workflow.
-The 35 MCP tools and 679 catalog entries are not all independently validated in
-Bambu Studio. The separate contract suite does not establish that coverage.
+**Experimental Bambu implementation.** The project keeps the Snapmaker wrapper's
+organization, public API declarations and compatibility types. Its document,
+engine, service, persistence, settings, schema-extraction and transport execution
+have been reimplemented for Bambu. See [implementation and validation scope](docs/implementation.md).
+The required native suite covers ten setting effects, a regional modifier,
+creation, layout, adaptive profiles and one real MCP workflow across all 35 tools.
+That workflow does not cover all modes, values, printers or all 679 settings.
 
 ## Baseline and requirements
 
@@ -136,10 +137,11 @@ Client setup and examples are in [usage](docs/usage.md), [macOS setup](MACOS.md)
 and [REST](docs/rest.md). [Linux/Docker](LINUX.md) is an explicitly unvalidated
 native deployment recipe.
 
-The adaptive-layer generator is inherited from the Snapmaker adapter and has not
-been validated against this Bambu source. An adaptive request fails clearly;
-reset and explicit height-range editing have separate contracts. A mathematical
-port test does not establish Bambu native behavior.
+The adaptive-layer generator uses the pinned Bambu source algorithm. Native
+regressions inspect actual layer Z spacing, explicit height ranges and reset.
+The wrapper overlays explicit ranges after generation. Bambu-native ordinal
+profile storage replaces the former wrapper-specific root-ID output; older
+root-ID profiles remain readable. See [validation limits](TEST.md).
 
 ## Development and provenance
 

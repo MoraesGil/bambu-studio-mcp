@@ -123,6 +123,7 @@ Variant-array length is not the number of physical filaments.
 5. Record tested identity/scope and gaps before integration. GUI equivalence,
    creation/discovery acceptance and physical printing require separate evidence.
 
-The inherited adaptive mathematical tests are not Bambu-native evidence. The
-public adaptive generator stays unavailable until separately validated against
-the selected Bambu source. See [TEST.md](../TEST.md).
+The adaptive generator now follows the pinned Bambu source. Native acceptance
+must observe actual extrusion layer Z spacing for fine/coarse profiles, explicit
+range overlay and reset. A saved profile or successful process exit alone does
+not prove consumption. See [TEST.md](../TEST.md).

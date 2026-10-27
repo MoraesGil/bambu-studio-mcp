@@ -294,7 +294,7 @@
    "extruder_max_nozzle_count"
   ],
   "scope": "PrintConfigDef source metadata; default expressions are not runtime values",
-  "extractor_origin": "MaxEllis/orcaslicer-mcp@ccfacb43c2fd5a23973bfdabce89c74b2f6933fe"
+  "extractor_origin": "bambu-studio-mcp/schema_extract.py"
  },
  "absolute_correction": {
   "label": "",

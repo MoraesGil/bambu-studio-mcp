@@ -125,8 +125,11 @@ off-bed; `move_object_to_plate` can restore them. The final plate cannot be remo
 
 `set_height_range` uses object-relative Z bands. Clearing those bands preserves
 an existing continuous profile. `set_layer_height(mode="reset")` clears both.
-The adaptive generator is inherited and not validated against Bambu; an
-adaptive request fails explicitly instead of claiming Bambu equivalence.
+`set_layer_height(mode="adaptive")` generates a profile using the pinned Bambu
+source algorithm. The wrapper applies explicit ranges as a separate overlay.
+Profiles use Bambu-native ordinal records; old wrapper root-ID records remain
+readable. Native acceptance covers fine/coarse/reset spacing on synthetic
+geometry, not every nozzle/material combination or GUI equivalence.
 
 ## Presets and native material variants
 

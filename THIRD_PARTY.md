@@ -7,11 +7,13 @@ included in the Python wheel or source distribution.
 
 ## Snapmaker wrapper lineage
 
-This repository adapts [MoraesGil/snapmaker-orca-mcp](https://github.com/MoraesGil/snapmaker-orca-mcp)
-at commit `f100c44d11576558d1290f4c48330477bde238a8`. It retains the wrapper's
-project/revision preservation, transport/storage architecture, tests and
-compatible AGPL notices. The package/import namespace and native adapter target
-are changed to Bambu Studio. No shared core library has been extracted.
+This repository started from [MoraesGil/snapmaker-orca-mcp](https://github.com/MoraesGil/snapmaker-orca-mcp)
+at commit `f100c44d11576558d1290f4c48330477bde238a8`. It retains organization,
+public contract declarations, DTOs, compatibility aliases, minimal forwarding
+boilerplate, tests and compatible AGPL notices. Executable document, engine,
+service, storage, setting, extraction and transport subsystems were subsequently
+reimplemented for Bambu. See [implementation scope](docs/implementation.md).
+No shared core library has been extracted.
 
 The Snapmaker wrapper itself was extracted from `tools/slicer_mcp` in
 [MoraesGil/OrcaSlicer](https://github.com/MoraesGil/OrcaSlicer) at
@@ -19,19 +21,23 @@ The Snapmaker wrapper itself was extracted from `tools/slicer_mcp` in
 Historical Snapmaker native acceptance, binary hashes and deployment reports do
 not establish Bambu support.
 
-The inherited adaptive mathematical port came from Snapmaker source
-`9bf2f18eaff7cc0655cbdeef6a215660085ecb0f`. Its public adaptive operation is not
-validated for Bambu and fails explicitly; retaining mathematical regression
-checks does not claim Bambu or GUI equivalence.
+The former adaptive mathematical port came from Snapmaker source
+`9bf2f18eaff7cc0655cbdeef6a215660085ecb0f`. It has been replaced by a Bambu
+source-derived implementation; retained mathematical tests remain specifications,
+not claims of universal native or GUI equivalence.
 
-## Max Ellis: three adapted Python helpers
+## Max Ellis: historical helper provenance and contract design
 
 Portions derive from **Max Ellis's OrcaSlicer MCP**,
 [MaxEllis/orcaslicer-mcp](https://github.com/MaxEllis/orcaslicer-mcp), package
 0.1.17 at `ccfacb43c2fd5a23973bfdabce89c74b2f6933fe`, licensed
 **AGPL-3.0-only**. Copyright remains with Max Ellis and the respective contributors.
 
-| Original file | Adaptation retained here |
+The initial adaptation included the helpers below. Their executable
+implementations have been replaced; this attribution preserves provenance and
+the contribution of their feature/contract design.
+
+| Original file | Responsibility reimplemented here |
 | --- | --- |
 | `src/orcaslicer_mcp/schema_extract.py` | Source-metadata parser in `src/bambu_studio_mcp/schema_extract.py` |
 | `src/orcaslicer_mcp/settings_schema.py` | Setting lookup/search through the preset service |
@@ -46,7 +52,7 @@ guard.py           72e99143a46ac717e06d9d19454d12fd76dd44771340934efed315cf56d5f
 LICENSE            0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0
 ```
 
-Local adaptations use versioned file edits, explicit custom-G-code opt-in,
+The implementation uses versioned file edits, explicit custom-G-code opt-in,
 native arrays, artifact-local drafts and hash-recorded inheritance. The MaxEllis
 tool design also informed feature names. This project does not incorporate its
 fork binary, GUI/RemoteAPI controller or printer client, and does not claim its
@@ -60,6 +66,19 @@ The separately supplied native engine is official
 That source is AGPLv3. Native runtime acquisition/building is separate from this
 wrapper. The separately distributed networking plugin is not redistributed by
 this package.
+
+The adaptive implementation derives from the pinned Bambu source:
+`src/libslic3r/Slicing.cpp` (profile construction) and
+`src/libslic3r/SlicingAdaptive.cpp` (facet events and layer-height sweep).
+Their SHA-256 values are respectively
+`36d379b8e26e5eb837c5118b516473f6c7ff3652e3ea9b58a14505577e7adf1c` and
+`2e7564a717aa8e94faca7973fb7cb44ae2753c4f64555d404b834f547b250aa5`.
+Copyright remains with the Bambu Studio/Slic3r/PrusaSlicer contributors under
+AGPLv3. Applying explicit range overrides after generation is wrapper behavior.
+
+Native ordinal layer-profile serialization follows the same source's
+`src/libslic3r/Format/bbs_3mf.cpp` importer/exporter. It replaces the former
+wrapper-specific version-2 output while preserving backward-compatible reads.
 
 `src/bambu_studio_mcp/data/settings.json` is generated from the exact Bambu source,
 not from the Snapmaker or MaxEllis generated catalog. The metadata identifies the
